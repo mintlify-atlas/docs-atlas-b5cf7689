@@ -1,97 +1,88 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Faiss — Efficient Similarity Search"
+description: "A high-performance library for similarity search and clustering of dense vectors, with CPU and GPU support. Built by Meta AI Research."
 ---
 
-## Setting up
+Faiss is a library for efficient similarity search and clustering of dense vectors. It handles sets of vectors of any size — from thousands to billions — and supports both exact and approximate nearest neighbor search. Faiss is written in C++ with complete Python/NumPy bindings, and key algorithms are GPU-accelerated via CUDA.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Build your first index and run a nearest neighbor search in minutes
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Index Overview" icon="layer-group" href="/concepts/indexes-overview">
+    Understand the index types and how to choose the right one for your use case
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="GPU Acceleration" icon="microchip" href="/guides/gpu-indexes">
+    Run billion-scale search on NVIDIA GPUs with drop-in replacements for CPU indexes
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Index Reference" icon="book" href="/reference/flat-indexes">
+    Complete reference for all index types, parameters, and methods
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Why Faiss?
 
-Everything you need to create world-class documentation.
+Faiss is designed for production-scale vector search. It provides a range of index types that trade off search speed, accuracy, and memory usage — giving you full control over the performance envelope for your workload.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={3}>
+  <Card title="Billion-scale" icon="database">
+    Handles datasets that don't fit in RAM using compressed quantization codes
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="GPU-native" icon="bolt">
+    GPU indexes are drop-in CPU replacements with automatic memory management
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="Flexible" icon="sliders">
+    Index factory strings let you compose complex pipelines in a single line
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+</CardGroup>
 
-## Need inspiration?
+## Core workflow
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Steps>
+  <Step title="Install Faiss">
+    Install via conda for CPU or GPU usage:
+    ```bash
+    conda install -c pytorch -c conda-forge faiss-cpu=1.14.1
+    ```
+  </Step>
+  <Step title="Build an index">
+    Create an index, add your vectors, and start searching:
+    ```python
+    import faiss
+    import numpy as np
+
+    d = 128          # vector dimension
+    index = faiss.IndexFlatL2(d)
+    vectors = np.random.random((10000, d)).astype('float32')
+    index.add(vectors)
+    ```
+  </Step>
+  <Step title="Search">
+    Query the index to find nearest neighbors:
+    ```python
+    query = np.random.random((5, d)).astype('float32')
+    k = 10           # number of nearest neighbors
+    distances, indices = index.search(query, k)
+    ```
+  </Step>
+  <Step title="Scale up">
+    Switch to an IVF or HNSW index for faster approximate search, or move to a GPU index for maximum throughput. See the [Guides](/guides/cpu-indexes) for details.
+  </Step>
+</Steps>
+
+## Explore the documentation
+
+<CardGroup cols={2}>
+  <Card title="Core concepts" icon="graduation-cap" href="/concepts/indexes-overview">
+    Learn about index types, distance metrics, and quantization techniques
+  </Card>
+  <Card title="Guides" icon="map" href="/guides/cpu-indexes">
+    Step-by-step guides for CPU indexes, GPU acceleration, clustering, and more
+  </Card>
+  <Card title="Advanced topics" icon="flask" href="/advanced/auto-tuning">
+    Auto-tuning, distributed search, benchmarking, and contrib modules
+  </Card>
+  <Card title="Index reference" icon="list" href="/reference/flat-indexes">
+    Detailed parameter reference for every index type in Faiss
+  </Card>
+</CardGroup>

@@ -1,0 +1,227 @@
+---
+title: 'K-means clustering'
+description: 'Use Faiss to run fast k-means clustering on large datasets, with CPU and GPU acceleration.'
+---
+
+Faiss provides a highly optimized k-means implementation that internally uses a Faiss index for the assignment step. This allows clustering to benefit from approximate search, GPU acceleration, and any index type that supports `search`.
+
+---
+
+## Basic k-means with faiss.Kmeans
+
+The Python `faiss.Kmeans` wrapper is the simplest way to run k-means. It accepts a `float32` matrix and returns centroids.
+
+<Steps>
+  <Step title="Prepare data">
+    ```python
+    import numpy as np
+    import faiss
+
+    d = 64         # vector dimension
+    n = 100000     # number of training points
+    k = 256        # number of clusters
+
+    np.random.seed(1234)
+    x = np.random.random((n, d)).astype('float32')
+    ```
+  </Step>
+  <Step title="Train k-means">
+    ```python
+    km = faiss.Kmeans(d, k, niter=20, verbose=True)
+    km.train(x)
+    ```
+
+    After training, `km.centroids` is a `(k, d)` float32 numpy array containing the final cluster centers.
+
+    ```python
+    print(km.centroids.shape)  # (256, 64)
+    ```
+  </Step>
+  <Step title="Assign new points to clusters">
+    Use the internal index to find the nearest centroid for each point:
+
+    ```python
+    # Returns distances D (n, 1) and centroid indices I (n, 1)
+    D, I = km.index.search(x, 1)
+    labels = I.flatten()       # cluster label for each vector
+    print(labels[:10])
+    ```
+  </Step>
+</Steps>
+
+---
+
+## ClusteringParameters options
+
+`faiss.Kmeans` exposes all fields from the C++ `ClusteringParameters` struct. Pass them as keyword arguments to the constructor.
+
+```python
+km = faiss.Kmeans(
+    d, k,
+    niter=25,                  # number of EM iterations
+    nredo=1,                   # how many times to redo clustering (best objective kept)
+    verbose=False,             # print progress
+    spherical=False,           # normalize centroids after each iteration (cosine k-means)
+    int_centroids=False,       # round centroid coordinates to nearest integer
+    update_index=False,        # retrain the assignment index after each iteration
+    min_points_per_centroid=39,  # warn if fewer training points per centroid
+    max_points_per_centroid=256, # subsample if more points per centroid
+    seed=1234,                 # random seed (negative = time-based)
+)
+km.train(x)
+```
+
+**Parameter reference** (defaults from `Clustering.h`):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `niter` | `25` | Number of Lloyd's algorithm iterations. More iterations = better objective, diminishing returns after ~20. |
+| `nredo` | `1` | Number of independent restarts. Best objective across all runs is returned. |
+| `verbose` | `False` | Print per-iteration objective, imbalance factor, and timing. |
+| `spherical` | `False` | L2-normalize centroids after each update. Use for cosine-similarity clustering (normalize inputs first). |
+| `int_centroids` | `False` | Round centroid coordinates to integers. Useful for integer vector spaces. |
+| `min_points_per_centroid` | `39` | Prints a warning if fewer training vectors per centroid are supplied. Fewer than 1 per centroid raises an error. |
+| `max_points_per_centroid` | `256` | Maximum training vectors per centroid. The dataset is uniformly subsampled when this limit is exceeded. |
+| `seed` | `1234` | RNG seed for reproducibility. Pass a negative value for time-seeded random initialization. |
+| `early_stop_threshold` | `0.0` | Stop if relative objective improvement falls below this fraction. `0.0` means stop only when objective is unchanged. |
+
+<Note>
+The `max_points_per_centroid` default caps training at `k × 256` vectors. For a dataset of 10M vectors and k=1024, at most 262,144 vectors are used for training. Increase this value (e.g., to `1000`) if you observe poor centroid quality.
+</Note>
+
+---
+
+## GPU-accelerated clustering
+
+Pass `gpu=True` to run the assignment step on the GPU. This is substantially faster for large `n` and `k`.
+
+```python
+import faiss
+import numpy as np
+
+d = 64
+n = 1000000
+k = 1024
+
+np.random.seed(42)
+x = np.random.random((n, d)).astype('float32')
+
+km = faiss.Kmeans(d, k, niter=20, verbose=True, gpu=True)
+km.train(x)
+
+print(km.centroids.shape)  # (1024, 64)
+```
+
+<Tip>
+When `gpu=True`, Faiss automatically uses all available GPUs via `index_cpu_to_all_gpus`. To target a specific GPU, construct the assignment index manually and pass it to the lower-level `Clustering` C++ interface.
+</Tip>
+
+You can also perform clustering directly through a GPU index by using the C++ `Clustering` class with a `GpuIndexFlatL2`:
+
+<Tabs>
+  <Tab title="Python (gpu=True shortcut)">
+    ```python
+    km = faiss.Kmeans(d, k, niter=20, gpu=True)
+    km.train(x)
+    centroids = km.centroids
+    ```
+  </Tab>
+  <Tab title="Python (manual GPU index)">
+    ```python
+    import faiss
+
+    res = faiss.StandardGpuResources()
+    flat_index = faiss.IndexFlatL2(d)
+    gpu_index = faiss.index_cpu_to_gpu(res, 0, flat_index)
+
+    clus = faiss.Clustering(d, k)
+    clus.niter = 20
+    clus.verbose = True
+    clus.train(x, gpu_index)
+
+    # centroids are in clus.centroids (k*d float32 array)
+    centroids = faiss.vector_float_to_array(clus.centroids).reshape(k, d)
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Initialization methods
+
+By default, Faiss initializes centroids by random sampling. Two better initialization strategies are available via `ClusteringInitMethod`:
+
+| Method | Description |
+|--------|-------------|
+| `RANDOM` | Uniform random sampling (default). O(nd) initialization. |
+| `KMEANS_PLUS_PLUS` | k-means++ seeding. O(nkd) initialization, better quality especially for small k. |
+| `AFK_MC2` | Assumption-Free K-MC² (fast approximation to k-means++). O(nd) + O(mk²d), controlled by `afkmc2_chain_length`. |
+
+```python
+# k-means++ initialization
+km = faiss.Kmeans(d, k, niter=20, init_method=faiss.ClusteringInitMethod.KMEANS_PLUS_PLUS)
+km.train(x)
+
+# AFK-MC2 initialization with chain length 100
+km = faiss.Kmeans(d, k, niter=20, init_method=faiss.ClusteringInitMethod.AFK_MC2)
+km.cp.afkmc2_chain_length = 100
+km.train(x)
+```
+
+<Note>
+`ClusteringInit_PlusPlus` and `ClusteringInit_AFKMC2` are defined in `faiss/impl/ClusteringInitialization.h`. The enum values are exposed in Python as `faiss.ClusteringInitMethod.KMEANS_PLUS_PLUS` and `faiss.ClusteringInitMethod.AFK_MC2`.
+</Note>
+
+---
+
+## 2-level hierarchical clustering
+
+For very large k (e.g., k = 1M) that would be slow to optimize directly, Faiss provides a 2-level hierarchical clustering routine in `faiss.contrib.clustering`. It first clusters into `sqrt(k)` coarse clusters, then sub-clusters each coarse cluster.
+
+```python
+from faiss.contrib.clustering import two_level_clustering
+import numpy as np
+import faiss
+
+d = 64
+n = 10_000_000
+k = 65536
+
+x = np.random.random((n, d)).astype('float32')
+
+# Train a 2-level hierarchical k-means
+index = two_level_clustering(x, k, verbose=True)
+# index is an IndexFlatL2 containing k centroids, ready for assignment
+```
+
+<Tip>
+Two-level clustering is especially useful for training large IVF indexes (e.g., `nlist = 65536`) where direct k-means would take many hours. The resulting centroids can be used directly as the quantizer in `IndexIVFFlat` or `IndexIVFPQ`.
+</Tip>
+
+---
+
+## Assigning points after training
+
+Once a `Kmeans` object is trained, use `km.index` (a flat index built over the centroids) to assign arbitrary new points:
+
+```python
+import numpy as np
+
+# New vectors to assign (not used during training)
+x_new = np.random.random((5000, d)).astype('float32')
+
+# Find the 1 nearest centroid for each point
+D, I = km.index.search(x_new, 1)
+labels = I.flatten()
+
+print(f"Assigned {len(labels)} vectors to {k} clusters")
+print(f"Cluster label range: {labels.min()} – {labels.max()}")
+```
+
+For quantization error statistics:
+
+```python
+# Mean distance to assigned centroid
+mean_error = D.mean()
+print(f"Mean quantization error: {mean_error:.4f}")
+```

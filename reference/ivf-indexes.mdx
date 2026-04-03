@@ -1,0 +1,444 @@
+---
+title: "IVF indexes"
+description: "Inverted file indexes for approximate search"
+---
+
+IVF (Inverted File) indexes partition the dataset into `nlist` clusters using a coarse quantizer. At query time, only the `nprobe` nearest clusters are searched, dramatically reducing the number of distance computations compared to exhaustive search. All IVF indexes require training before vectors can be added.
+
+## Core concepts
+
+**`nlist`** — Number of inverted lists (Voronoi cells). Larger `nlist` means finer partitioning: queries search fewer vectors per cluster but must probe more clusters to maintain recall. A common rule of thumb is `nlist ≈ sqrt(nb)` for datasets of `nb` vectors.
+
+**`nprobe`** — Number of lists visited at query time. Higher `nprobe` increases recall but increases search time proportionally. Set it at search time: `index.nprobe = 10`.
+
+**Training** — All IVF indexes must be trained on a representative sample of the dataset to build the coarse quantizer centroids. The training set should contain at least `39 * nlist` vectors (the default k-means requirement).
+
+## nprobe vs. recall tradeoff
+
+| `nprobe` | Approximate recall@1 | Search time (relative) |
+|---|---|---|
+| 1 (default) | ~30–50% | 1× |
+| 10 | ~80–90% | ~5–10× |
+| 50 | ~95–99% | ~25–40× |
+| `nlist` | 100% (exhaustive) | same as `IndexFlat` |
+
+Exact figures depend on dataset, `nlist`, and encoder type.
+
+---
+
+## IndexIVFFlat
+
+Partitions vectors into `nlist` clusters and stores the full float32 vectors inside each inverted list. Provides exact distance computations within each visited cluster — the only source of approximation is the choice of which clusters to visit (`nprobe`).
+
+```cpp
+IndexIVFFlat(
+    Index* quantizer,
+    size_t d,
+    size_t nlist,
+    MetricType metric = METRIC_L2,
+    bool own_invlists = true);
+```
+
+<ParamField path="quantizer" type="Index*" required>
+  Coarse quantizer that maps vectors to inverted lists. Typically `IndexFlatL2`. The `IndexIVFFlat` does not own this pointer by default.
+</ParamField>
+
+<ParamField path="d" type="size_t" required>
+  Dimensionality of the input vectors.
+</ParamField>
+
+<ParamField path="nlist" type="size_t" required>
+  Number of inverted lists (clusters).
+</ParamField>
+
+<ParamField path="metric" type="MetricType">
+  Distance metric. Default: `METRIC_L2`.
+</ParamField>
+
+<ParamField path="own_invlists" type="bool">
+  If `true` (default), the index owns and will free the inverted lists on destruction.
+</ParamField>
+
+**When to use:** Datasets of 1M–100M vectors where exact distances are needed within each cluster (no compression), and ~20–30 bytes/vector memory budget is acceptable.
+
+<Tabs>
+  <Tab title="Python">
+    ```python
+    import faiss
+    import numpy as np
+
+    d = 64
+    nb = 100000
+    nq = 10000
+
+    np.random.seed(1234)
+    xb = np.random.random((nb, d)).astype('float32')
+    xq = np.random.random((nq, d)).astype('float32')
+
+    nlist = 100
+    quantizer = faiss.IndexFlatL2(d)  # coarse quantizer
+    index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
+
+    assert not index.is_trained
+    index.train(xb)          # train the coarse quantizer
+    assert index.is_trained
+
+    index.add(xb)            # add vectors
+
+    index.nprobe = 10        # search 10 clusters instead of the default 1
+    D, I = index.search(xq, 4)
+    print(I[-5:])
+    ```
+  </Tab>
+  <Tab title="C++">
+    ```cpp
+    #include <faiss/IndexFlat.h>
+    #include <faiss/IndexIVFFlat.h>
+
+    int d = 64, nlist = 100;
+
+    faiss::IndexFlatL2 quantizer(d);
+    faiss::IndexIVFFlat index(&quantizer, d, nlist);
+
+    index.train(nb, xb);
+    index.add(nb, xb);
+
+    index.nprobe = 10;
+
+    std::vector<faiss::idx_t> I(k * nq);
+    std::vector<float> D(k * nq);
+    index.search(nq, xq, k, D.data(), I.data());
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## IndexIVFPQ
+
+Extends `IndexIVFFlat` by encoding residual vectors with Product Quantization. Vectors are first assigned to a cluster; the residual from the cluster centroid is then compressed using a PQ code. This reduces memory by 4–16× compared to `IndexIVFFlat` at the cost of additional recall loss from the PQ approximation.
+
+```cpp
+IndexIVFPQ(
+    Index* quantizer,
+    size_t d,
+    size_t nlist,
+    size_t M,
+    size_t nbits_per_idx,
+    MetricType metric = METRIC_L2,
+    bool own_invlists = true);
+```
+
+<ParamField path="quantizer" type="Index*" required>
+  Coarse quantizer. Typically `IndexFlatL2`.
+</ParamField>
+
+<ParamField path="d" type="size_t" required>
+  Dimensionality of the input vectors.
+</ParamField>
+
+<ParamField path="nlist" type="size_t" required>
+  Number of inverted lists.
+</ParamField>
+
+<ParamField path="M" type="size_t" required>
+  Number of PQ sub-quantizers. Each sub-vector has dimension `d / M`. `d` must be divisible by `M`.
+</ParamField>
+
+<ParamField path="nbits_per_idx" type="size_t" required>
+  Bits per PQ code. Typically `8` (256 centroids per sub-quantizer).
+</ParamField>
+
+<ParamField path="metric" type="MetricType">
+  Distance metric. Default: `METRIC_L2`.
+</ParamField>
+
+**Memory per vector:** `M * nbits_per_idx / 8` bytes (PQ code only, excluding list overhead).
+
+**When to use:** Large datasets (100M+ vectors) where both memory and speed are constraints. The recommended index for most large-scale ANN tasks.
+
+<Tabs>
+  <Tab title="Python">
+    ```python
+    import faiss
+    import numpy as np
+
+    d = 64
+    nb = 100000
+
+    np.random.seed(1234)
+    xb = np.random.random((nb, d)).astype('float32')
+    xq = np.random.random((10000, d)).astype('float32')
+
+    nlist = 100
+    m = 8           # number of sub-quantizers
+    quantizer = faiss.IndexFlatL2(d)
+    index = faiss.IndexIVFPQ(quantizer, d, nlist, m, 8)
+    # 8 bits per sub-quantizer → m bytes per vector
+
+    index.train(xb)
+    index.add(xb)
+
+    index.nprobe = 10
+    D, I = index.search(xq, 4)
+    print(I[-5:])
+    ```
+  </Tab>
+  <Tab title="C++">
+    ```cpp
+    #include <faiss/IndexFlat.h>
+    #include <faiss/IndexIVFPQ.h>
+
+    int d = 64, nlist = 100, m = 8, nbits = 8;
+
+    faiss::IndexFlatL2 quantizer(d);
+    faiss::IndexIVFPQ index(&quantizer, d, nlist, m, nbits);
+
+    index.train(nb, xb);
+    index.add(nb, xb);
+
+    index.nprobe = 10;
+    index.search(nq, xq, k, D, I);
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## IndexIVFPQR
+
+Extends `IndexIVFPQ` with a second-level PQ refinement stage. After retrieving `k_factor * k` candidates from the IVFPQ search, it re-ranks them using a finer PQ code (`refine_pq`), then returns the top `k`. This improves recall with a controllable speed/quality tradeoff.
+
+```cpp
+IndexIVFPQR(
+    Index* quantizer,
+    size_t d,
+    size_t nlist,
+    size_t M,
+    size_t nbits_per_idx,
+    size_t M_refine,
+    size_t nbits_per_idx_refine,
+    bool own_invlists = true);
+```
+
+<ParamField path="quantizer" type="Index*" required>
+  Coarse quantizer.
+</ParamField>
+
+<ParamField path="d" type="size_t" required>
+  Dimensionality of the input vectors.
+</ParamField>
+
+<ParamField path="nlist" type="size_t" required>
+  Number of inverted lists.
+</ParamField>
+
+<ParamField path="M" type="size_t" required>
+  Number of PQ sub-quantizers for the first-level code.
+</ParamField>
+
+<ParamField path="nbits_per_idx" type="size_t" required>
+  Bits per first-level PQ code (typically 8).
+</ParamField>
+
+<ParamField path="M_refine" type="size_t" required>
+  Number of PQ sub-quantizers for the refinement code. Must satisfy `d % M_refine == 0`.
+</ParamField>
+
+<ParamField path="nbits_per_idx_refine" type="size_t" required>
+  Bits per refinement PQ code (typically 8).
+</ParamField>
+
+Key field: `k_factor` (default varies) — ratio of candidates retrieved in the first pass to `k`.
+
+```python
+import faiss
+
+d = 64
+nlist = 100
+quantizer = faiss.IndexFlatL2(d)
+# First-level: 8 sub-quantizers × 8 bits; refinement: 16 sub-quantizers × 8 bits
+index = faiss.IndexIVFPQR(quantizer, d, nlist, 8, 8, 16, 8)
+index.train(xb)
+index.add(xb)
+index.nprobe = 10
+D, I = index.search(xq, 4)
+```
+
+---
+
+## IndexIVFScalarQuantizer
+
+An IVF index that encodes residual vectors with a scalar quantizer instead of PQ. Offers better recall than IVFPQ at the same nlist/nprobe with a moderate increase in memory (1–2 bytes per dimension per vector rather than a few bytes total).
+
+```cpp
+IndexIVFScalarQuantizer(
+    Index* quantizer,
+    size_t d,
+    size_t nlist,
+    ScalarQuantizer::QuantizerType qtype,
+    MetricType metric = METRIC_L2,
+    bool by_residual = true,
+    bool own_invlists = true);
+```
+
+<ParamField path="quantizer" type="Index*" required>
+  Coarse quantizer.
+</ParamField>
+
+<ParamField path="d" type="size_t" required>
+  Dimensionality of the input vectors.
+</ParamField>
+
+<ParamField path="nlist" type="size_t" required>
+  Number of inverted lists.
+</ParamField>
+
+<ParamField path="qtype" type="ScalarQuantizer::QuantizerType" required>
+  Quantizer type: `QT_8bit`, `QT_4bit`, `QT_8bit_uniform`, `QT_fp16`, `QT_bf16`, etc.
+</ParamField>
+
+<ParamField path="metric" type="MetricType">
+  Distance metric. Default: `METRIC_L2`.
+</ParamField>
+
+<ParamField path="by_residual" type="bool">
+  If `true` (default), encodes the residual from the cluster centroid. Better recall than encoding the raw vector.
+</ParamField>
+
+```python
+import faiss
+
+d = 128
+nlist = 256
+quantizer = faiss.IndexFlatL2(d)
+index = faiss.IndexIVFScalarQuantizer(
+    quantizer, d, nlist,
+    faiss.ScalarQuantizer.QT_8bit,
+    faiss.METRIC_L2
+)
+index.train(xb)
+index.add(xb)
+index.nprobe = 16
+D, I = index.search(xq, 10)
+```
+
+---
+
+## IndexIVFPQFastScan
+
+A SIMD-optimized variant of `IndexIVFPQ` that reorganizes PQ codes in each inverted list into SIMD-friendly blocks. Delivers substantially higher search throughput on CPUs with AVX2/AVX-512. Currently supports 4-bit PQ (`nbits=4`).
+
+```cpp
+IndexIVFPQFastScan(
+    Index* quantizer,
+    size_t d,
+    size_t nlist,
+    size_t M,
+    size_t nbits,
+    MetricType metric = METRIC_L2,
+    int bbs = 32,
+    bool own_invlists = true);
+```
+
+<ParamField path="quantizer" type="Index*" required>
+  Coarse quantizer.
+</ParamField>
+
+<ParamField path="d" type="size_t" required>
+  Dimensionality of the input vectors.
+</ParamField>
+
+<ParamField path="nlist" type="size_t" required>
+  Number of inverted lists.
+</ParamField>
+
+<ParamField path="M" type="size_t" required>
+  Number of PQ sub-quantizers.
+</ParamField>
+
+<ParamField path="nbits" type="size_t" required>
+  Bits per sub-quantizer. Must be `4` for the fast-scan implementation.
+</ParamField>
+
+<ParamField path="bbs" type="int">
+  Block size for SIMD scanning. Default: `32`.
+</ParamField>
+
+```python
+import faiss
+import numpy as np
+
+d = 128
+nlist = 256
+quantizer = faiss.IndexFlatL2(d)
+index = faiss.IndexIVFPQFastScan(quantizer, d, nlist, 32, 4)
+index.train(xb)
+index.add(xb)
+index.nprobe = 16
+D, I = index.search(xq, 10)
+```
+
+---
+
+## IndexIVFAdditiveQuantizer
+
+Abstract base class for IVF indexes that use additive quantization (residual quantization or local search quantization) to encode residual vectors. Concrete subclasses include `IndexIVFResidualQuantizer` and `IndexIVFLocalSearchQuantizer`.
+
+```cpp
+IndexIVFAdditiveQuantizer(
+    AdditiveQuantizer* aq,
+    Index* quantizer,
+    size_t d,
+    size_t nlist,
+    MetricType metric = METRIC_L2,
+    bool own_invlists = true);
+```
+
+<ParamField path="aq" type="AdditiveQuantizer*" required>
+  The additive quantizer instance that encodes residuals.
+</ParamField>
+
+<ParamField path="quantizer" type="Index*" required>
+  Coarse quantizer (e.g., `IndexFlatL2`).
+</ParamField>
+
+<ParamField path="d" type="size_t" required>
+  Dimensionality of the input vectors.
+</ParamField>
+
+<ParamField path="nlist" type="size_t" required>
+  Number of inverted lists.
+</ParamField>
+
+<Tip>
+  Additive quantizers can achieve higher recall than PQ at the same code size but are slower to encode and decode. Use them when recall quality is the priority and encoding time is less critical.
+</Tip>
+
+---
+
+## Choosing a coarse quantizer
+
+The coarse quantizer maps each vector to an inverted list at add and search time. The choice affects build time and search quality.
+
+| Quantizer | Tradeoff |
+|---|---|
+| `IndexFlatL2` | Exact assignment, slower training for large `nlist`. The standard choice. |
+| `IndexHNSWFlat` (M=32) | Approximate assignment, faster for large `nlist` (> 65536). Set `quantizer_trains_alone = 2`. |
+| `MultiIndexQuantizer` | Efficient for very large `nlist` (power of 2). |
+
+```python
+import faiss
+
+d = 128
+nlist = 4096
+
+# Standard: flat coarse quantizer
+quantizer = faiss.IndexFlatL2(d)
+index = faiss.IndexIVFFlat(quantizer, d, nlist)
+
+# Alternative: HNSW coarse quantizer for large nlist
+quantizer_hnsw = faiss.IndexHNSWFlat(d, 32)
+index_hnsw = faiss.IndexIVFFlat(quantizer_hnsw, d, nlist)
+index_hnsw.quantizer_trains_alone = 2  # train quantizer separately
+```

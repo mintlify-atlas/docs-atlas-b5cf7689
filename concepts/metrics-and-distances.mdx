@@ -1,0 +1,251 @@
+---
+title: "Metrics and distances"
+description: "How Faiss measures similarity between vectors: L2, inner product, cosine similarity, and other supported metrics."
+---
+
+Faiss represents similarity (or dissimilarity) between vectors using a **metric type**. Every index stores its metric in the `metric_type` field (a value from the `MetricType` enum defined in `faiss/MetricType.h`). The metric controls how `search()` ranks results and whether smaller or larger values indicate a better match.
+
+---
+
+## MetricType enum
+
+```cpp
+enum MetricType {
+    METRIC_INNER_PRODUCT, ///< maximum inner product search
+    METRIC_L2,            ///< squared L2 search
+    METRIC_L1,            ///< L1 (aka cityblock)
+    METRIC_Linf,          ///< infinity distance
+    METRIC_Lp,            ///< L_p distance, p given by metric_arg
+
+    // Additional metrics
+    METRIC_Canberra = 20,
+    METRIC_BrayCurtis,
+    METRIC_JensenShannon,
+    METRIC_Jaccard,
+    METRIC_NaNEuclidean,
+    METRIC_GOWER,
+};
+```
+
+<Note>
+Most index types (`IndexIVFFlat`, `IndexHNSW`, `IndexPQ`, etc.) support only `METRIC_L2` and `METRIC_INNER_PRODUCT`. The additional metrics (`METRIC_L1`, `METRIC_Linf`, `METRIC_Canberra`, etc.) are supported by flat (brute-force) indexes only.
+</Note>
+
+The library also exposes a helper that distinguishes similarity metrics from dissimilarity metrics:
+
+```cpp
+constexpr bool is_similarity_metric(MetricType metric_type) {
+    return ((metric_type == METRIC_INNER_PRODUCT) ||
+            (metric_type == METRIC_Jaccard));
+}
+```
+
+For **similarity metrics** (`METRIC_INNER_PRODUCT`, `METRIC_Jaccard`), search returns the vectors with the **largest** values. For all other metrics (distances), search returns the vectors with the **smallest** values.
+
+---
+
+## L2 (squared Euclidean) distance
+
+`METRIC_L2` computes the **squared** Euclidean distance between two vectors **a** and **b** of dimension `d`:
+
+$$
+d(a, b) = \sum_{i=0}^{d-1} (a_i - b_i)^2
+$$
+
+<Note>
+Faiss stores and returns *squared* L2 distances, not the Euclidean distance itself. This avoids the cost of computing a square root and does not change the ranking of results.
+</Note>
+
+**When to use:** L2 is the default metric and is appropriate when you want to find vectors that are close in Euclidean space. It is the right choice when your embeddings are not normalized and magnitude carries information.
+
+```python
+import faiss
+import numpy as np
+
+d = 128
+index = faiss.IndexFlatL2(d)
+
+xb = np.random.rand(10_000, d).astype("float32")
+xq = np.random.rand(5, d).astype("float32")
+
+index.add(xb)
+D, I = index.search(xq, k=4)
+# D[i, j] is the squared L2 distance from query i to its j-th nearest neighbor
+```
+
+```cpp
+// C++
+faiss::IndexFlatL2 index(d);
+index.add(n, xb);
+index.search(nq, xq, k, distances, labels);
+```
+
+---
+
+## Inner product
+
+`METRIC_INNER_PRODUCT` computes the dot product between two vectors:
+
+$$
+\text{score}(a, b) = \sum_{i=0}^{d-1} a_i \cdot b_i
+$$
+
+Search **maximizes** this value — the nearest neighbors are those with the **highest** dot product. This makes inner product suitable for maximum inner product search (MIPS), which is common in recommendation systems and retrieval-augmented generation pipelines.
+
+```python
+import faiss
+
+d = 128
+index = faiss.IndexFlatIP(d)
+```
+
+```python
+# Using index_factory with inner product metric
+index = faiss.index_factory(d, "IVF100,Flat", faiss.METRIC_INNER_PRODUCT)
+```
+
+```python
+# Direct construction of an IVF index with inner product
+quantizer = faiss.IndexFlatIP(d)
+index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
+```
+
+<Warning>
+`METRIC_INNER_PRODUCT` maximizes the dot product. If your vectors are not normalized, vectors with large magnitudes will dominate the results regardless of direction. This is usually not what you want for semantic similarity. Normalize your vectors first if you intend to measure cosine similarity.
+</Warning>
+
+---
+
+## Cosine similarity
+
+Cosine similarity is the inner product of **unit-normalized** vectors:
+
+$$
+\cos(a, b) = \frac{a \cdot b}{\|a\| \cdot \|b\|}
+$$
+
+Faiss does not have a dedicated `METRIC_COSINE`. Instead, you normalize your vectors to unit length before indexing, then use `METRIC_INNER_PRODUCT`. After normalization, the dot product equals the cosine similarity.
+
+Faiss provides `faiss.normalize_L2` (Python) / `faiss::fvec_renorm_L2` (C++) for in-place L2 normalization:
+
+```python
+import faiss
+import numpy as np
+
+d = 128
+xb = np.random.rand(10_000, d).astype("float32")
+xq = np.random.rand(5, d).astype("float32")
+
+# Normalize to unit length
+faiss.normalize_L2(xb)
+faiss.normalize_L2(xq)
+
+# Use inner product index — results are now cosine similarities
+index = faiss.IndexFlatIP(d)
+index.add(xb)
+D, I = index.search(xq, k=4)
+# D[i, j] is the cosine similarity (in [-1, 1]) between query i and neighbor j
+```
+
+<Tip>
+If your embeddings come from a model that already outputs normalized vectors (e.g., sentence-transformers with `normalize_embeddings=True`), you can skip the normalization step and use `IndexFlatIP` directly.
+</Tip>
+
+---
+
+## Other metrics
+
+The following metrics are available on flat (brute-force) indexes via `IndexFlat` with the appropriate `MetricType`.
+
+<Tabs>
+  <Tab title="L1 (cityblock)">
+    **`METRIC_L1`** computes the Manhattan distance (sum of absolute differences):
+
+    $$
+    d(a, b) = \sum_{i=0}^{d-1} |a_i - b_i|
+    $$
+
+    ```python
+    import faiss
+    index = faiss.IndexFlat(d, faiss.METRIC_L1)
+    ```
+
+    Useful when you want a distance that is less sensitive to large outlier components than L2.
+  </Tab>
+  <Tab title="L-infinity">
+    **`METRIC_Linf`** computes the Chebyshev distance (maximum absolute difference across dimensions):
+
+    $$
+    d(a, b) = \max_{i} |a_i - b_i|
+    $$
+
+    ```python
+    import faiss
+    index = faiss.IndexFlat(d, faiss.METRIC_Linf)
+    ```
+  </Tab>
+  <Tab title="L_p (general)">
+    **`METRIC_Lp`** computes the general Minkowski distance with exponent `p`. The `p` value is set via the index's `metric_arg` field.
+
+    $$
+    d(a, b) = \left(\sum_{i=0}^{d-1} |a_i - b_i|^p\right)^{1/p}
+    $$
+
+    ```cpp
+    faiss::IndexFlat index(d, faiss::METRIC_Lp);
+    index.metric_arg = 3.0f;  // p = 3
+    ```
+  </Tab>
+  <Tab title="Additional metrics">
+    These additional metrics are defined in `MetricType.h` and are available on `IndexFlat`:
+
+    | Metric | Enum value | Description |
+    |---|---|---|
+    | Canberra | `METRIC_Canberra` | Weighted L1, normalized by sum of absolute values |
+    | Bray-Curtis | `METRIC_BrayCurtis` | Dissimilarity used in ecology |
+    | Jensen-Shannon | `METRIC_JensenShannon` | Symmetric variant of KL divergence |
+    | Jaccard | `METRIC_Jaccard` | `sum(min(a,b)) / sum(max(a,b))` for non-negative vectors; **similarity metric** (maximized) |
+    | NaN-Euclidean | `METRIC_NaNEuclidean` | Squared Euclidean distance, ignoring NaN components |
+    | Gower | `METRIC_GOWER` | Mixed numeric/categorical distance |
+
+    ```python
+    import faiss
+    index = faiss.IndexFlat(d, faiss.METRIC_Canberra)
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Setting the metric via index_factory
+
+```python
+import faiss
+
+d = 128
+
+# L2 (default)
+index = faiss.index_factory(d, "IVF256,PQ8")
+
+# Inner product
+index = faiss.index_factory(d, "IVF256,PQ8", faiss.METRIC_INNER_PRODUCT)
+
+# Flat with inner product
+index = faiss.index_factory(d, "Flat", faiss.METRIC_INNER_PRODUCT)
+```
+
+---
+
+## Quick reference
+
+| Metric | Use case | Search direction |
+|---|---|---|
+| `METRIC_L2` | General-purpose similarity, unnormalized embeddings | Minimize (smaller = closer) |
+| `METRIC_INNER_PRODUCT` | MIPS, normalized embeddings, cosine similarity | Maximize (larger = closer) |
+| `METRIC_L1` | Sparse or non-Gaussian data | Minimize |
+| `METRIC_Linf` | Chebyshev / max-component distance | Minimize |
+| `METRIC_Jaccard` | Non-negative vectors, set similarity | Maximize |
+
+<Note>
+For cosine similarity, normalize vectors to unit length with `faiss.normalize_L2()` and use `METRIC_INNER_PRODUCT`. After normalization, inner product equals cosine similarity.
+</Note>

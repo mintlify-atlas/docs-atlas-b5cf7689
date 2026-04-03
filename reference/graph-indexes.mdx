@@ -1,0 +1,346 @@
+---
+title: "Graph-based indexes"
+description: "HNSW and NSG indexes for fast approximate search"
+---
+
+Graph-based indexes build a navigable proximity graph over the dataset. At query time, search starts from one or more entry points and greedily traverses the graph toward the nearest neighbors. They offer an excellent recall/speed tradeoff, require no training (for flat storage variants), and support incremental addition of vectors.
+
+## Comparison: graph vs. IVF
+
+| Property | HNSW | NSG | IVFFlat |
+|---|---|---|---|
+| Training required | No (flat) | No (flat) | Yes |
+| Incremental add | Yes | Yes | Yes |
+| Memory overhead | Graph edges (~M×4 bytes/vec) | Graph edges (~R×4 bytes/vec) | Minimal |
+| Build time | Moderate | Moderate–High | Fast |
+| Search speed | Very fast | Very fast | Fast (with nprobe tuning) |
+| Recall@10 | High | High | Depends on nprobe |
+| Delete support | No | No | Yes (with direct map) |
+
+---
+
+## IndexHNSWFlat
+
+An HNSW (Hierarchical Navigable Small World) graph built on top of flat float32 storage. The multilevel graph structure enables logarithmic-time approximate search. No training is required.
+
+```cpp
+IndexHNSWFlat(int d, int M, MetricType metric = METRIC_L2);
+```
+
+<ParamField path="d" type="int" required>
+  Dimensionality of the input vectors.
+</ParamField>
+
+<ParamField path="M" type="int" required>
+  Number of connections per node in the HNSW graph. Level-0 nodes have up to `2 * M` connections; higher levels have up to `M`. Typical values: 16–64. Higher `M` gives better recall but increases memory and build time.
+</ParamField>
+
+<ParamField path="metric" type="MetricType">
+  Distance metric. Default: `METRIC_L2`.
+</ParamField>
+
+### Key search parameters
+
+Set these on `index.hnsw` before searching:
+
+- **`efSearch`** (default: `16`) — Size of the dynamic candidate list during search. Higher values improve recall at the cost of speed.
+- **`efConstruction`** (default: `40`) — Size of the candidate list during index construction. Higher values improve index quality at the cost of build time.
+
+```python
+index.hnsw.efSearch = 64        # set before searching
+index.hnsw.efConstruction = 40  # set before adding vectors
+```
+
+**When to use:** When you need fast approximate search without training, support for incremental adds, and can afford the memory overhead of the graph structure (~`M × 4 × 2` bytes per vector for the edge lists).
+
+<Tabs>
+  <Tab title="Python">
+    ```python
+    import faiss
+    import numpy as np
+
+    d = 64
+    nb = 100000
+    nq = 10000
+
+    np.random.seed(42)
+    xb = np.random.random((nb, d)).astype('float32')
+    xq = np.random.random((nq, d)).astype('float32')
+
+    M = 32
+    index = faiss.IndexHNSWFlat(d, M)
+    index.hnsw.efConstruction = 40  # set before adding
+    index.add(xb)                   # no training needed
+
+    index.hnsw.efSearch = 64        # set before searching
+    k = 4
+    D, I = index.search(xq, k)
+    print(I[-5:])
+    ```
+  </Tab>
+  <Tab title="C++">
+    ```cpp
+    #include <faiss/IndexHNSW.h>
+
+    int d = 64;
+    int nb = 100000;
+    int nq = 10000;
+    int k = 4;
+
+    faiss::IndexHNSWFlat index(d, 32);
+    index.hnsw.efConstruction = 40;
+    index.add(nb, xb);
+
+    index.hnsw.efSearch = 64;
+
+    std::vector<faiss::idx_t> I(k * nq);
+    std::vector<float> D(k * nq);
+    index.search(nq, xq, k, D.data(), I.data());
+
+    for (int i = nq - 5; i < nq; i++) {
+        for (int j = 0; j < k; j++) {
+            printf("%5zd ", I[i * k + j]);
+        }
+        printf("\n");
+    }
+    ```
+  </Tab>
+</Tabs>
+
+### Memory requirements
+
+Each vector stored in `IndexHNSWFlat` uses:
+- **Vector storage:** `d × 4` bytes (float32)
+- **Graph edges:** approximately `M × 2 × 4` bytes at level 0, plus additional edges at higher levels
+
+For `d=128`, `M=32`: approximately 512 + 256 = ~768 bytes per vector.
+
+<Note>
+  HNSW does not support removing vectors from the index. If you need deletion, consider `IndexIVFFlat` with a direct map.
+</Note>
+
+---
+
+## IndexHNSWSQ
+
+HNSW graph combined with scalar quantization for the vector storage. Reduces memory compared to `IndexHNSWFlat` while retaining the graph structure. Vectors are reconstructed during search for distance computations.
+
+```cpp
+IndexHNSWSQ(
+    int d,
+    ScalarQuantizer::QuantizerType qtype,
+    int M,
+    MetricType metric = METRIC_L2);
+```
+
+<ParamField path="d" type="int" required>
+  Dimensionality of the input vectors.
+</ParamField>
+
+<ParamField path="qtype" type="ScalarQuantizer::QuantizerType" required>
+  Scalar quantizer type (e.g., `QT_8bit`, `QT_4bit`, `QT_fp16`).
+</ParamField>
+
+<ParamField path="M" type="int" required>
+  Number of connections per HNSW node.
+</ParamField>
+
+<ParamField path="metric" type="MetricType">
+  Distance metric. Default: `METRIC_L2`.
+</ParamField>
+
+```python
+import faiss
+
+d = 128
+M = 32
+# 8-bit scalar quantization reduces vector storage from 512B to 128B per vector
+index = faiss.IndexHNSWSQ(d, faiss.ScalarQuantizer.QT_8bit, M)
+index.train(xb)    # ScalarQuantizer requires training to learn ranges
+index.add(xb)
+D, I = index.search(xq, 4)
+```
+
+---
+
+## IndexHNSWPQ
+
+HNSW graph combined with product quantization for the vector storage. Achieves more aggressive memory compression than `IndexHNSWSQ` at the cost of additional recall loss.
+
+```cpp
+IndexHNSWPQ(
+    int d,
+    int pq_m,
+    int M,
+    int pq_nbits = 8,
+    MetricType metric = METRIC_L2);
+```
+
+<ParamField path="d" type="int" required>
+  Dimensionality of the input vectors.
+</ParamField>
+
+<ParamField path="pq_m" type="int" required>
+  Number of PQ sub-quantizers for the storage quantizer.
+</ParamField>
+
+<ParamField path="M" type="int" required>
+  Number of connections per HNSW node.
+</ParamField>
+
+<ParamField path="pq_nbits" type="int">
+  Bits per PQ sub-quantizer. Default: `8`.
+</ParamField>
+
+<ParamField path="metric" type="MetricType">
+  Distance metric. Default: `METRIC_L2`.
+</ParamField>
+
+```python
+import faiss
+
+d = 128
+pq_m = 16   # 16 PQ sub-quantizers → 16 bytes/vector
+M = 32      # HNSW connections
+
+index = faiss.IndexHNSWPQ(d, pq_m, M)
+index.train(xb)   # PQ requires training
+index.add(xb)
+D, I = index.search(xq, 4)
+```
+
+---
+
+## IndexNSGFlat
+
+An NSG (Navigating Spread-out Graph) index built on top of flat float32 storage. NSG uses a different graph construction algorithm from HNSW — it builds a monotonic relative neighborhood graph optimized for navigation, which can achieve better recall/speed tradeoffs on some datasets.
+
+```cpp
+IndexNSGFlat(int d, int R, MetricType metric = METRIC_L2);
+```
+
+<ParamField path="d" type="int" required>
+  Dimensionality of the input vectors.
+</ParamField>
+
+<ParamField path="R" type="int" required>
+  Graph degree (maximum number of out-edges per node). Default: `32`. Higher `R` improves recall but increases memory and build time.
+</ParamField>
+
+<ParamField path="metric" type="MetricType">
+  Distance metric. Default: `METRIC_L2`.
+</ParamField>
+
+Key fields on the `IndexNSGFlat` instance:
+- `GK` (default: `64`) — K for the initial KNN graph construction.
+- `build_type` — `0` for brute-force KNN, `1` for NNDescent-based KNN graph.
+
+**When to use:** When benchmarks on your dataset show NSG outperforms HNSW at the same memory budget. NSG tends to perform well on datasets with clustered or skewed distributions.
+
+```python
+import faiss
+import numpy as np
+
+d = 64
+nb = 100000
+xb = np.random.random((nb, d)).astype('float32')
+
+R = 32  # graph degree
+index = faiss.IndexNSGFlat(d, R)
+index.build_type = 1  # use NNDescent for KNN graph construction
+index.add(xb)         # builds the NSG graph
+
+xq = np.random.random((100, d)).astype('float32')
+D, I = index.search(xq, 4)
+print(I)
+```
+
+<Warning>
+  NSG requires that all vectors be added at once via a single `add()` call before the graph is built. It does not support incremental vector addition after initial construction.
+</Warning>
+
+### NSG vs. HNSW
+
+| Property | HNSW | NSG |
+|---|---|---|
+| Graph type | Hierarchical (multi-level) | Single-layer monotonic RNG |
+| Incremental add | Yes | Limited |
+| Build complexity | `O(n log n)` | `O(n × GK)` + refinement |
+| Memory (edges) | ~`M × 2` entries/node | ~`R` entries/node |
+| Typical sweet spot | General-purpose | High-recall regimes on some datasets |
+
+---
+
+## IndexNSGPQ
+
+NSG graph backed by a product-quantized storage index. Reduces memory for the vector data while retaining the NSG navigation structure.
+
+```cpp
+IndexNSGPQ(int d, int pq_m, int M, int pq_nbits = 8);
+```
+
+<ParamField path="d" type="int" required>
+  Dimensionality of the input vectors.
+</ParamField>
+
+<ParamField path="pq_m" type="int" required>
+  Number of PQ sub-quantizers.
+</ParamField>
+
+<ParamField path="M" type="int" required>
+  NSG graph degree.
+</ParamField>
+
+<ParamField path="pq_nbits" type="int">
+  Bits per PQ sub-quantizer. Default: `8`.
+</ParamField>
+
+---
+
+## IndexNSGSQ
+
+NSG graph backed by scalar-quantized storage.
+
+```cpp
+IndexNSGSQ(
+    int d,
+    ScalarQuantizer::QuantizerType qtype,
+    int M,
+    MetricType metric = METRIC_L2);
+```
+
+---
+
+## IndexNNDescentFlat
+
+An index based on NNDescent graph construction, using flat float32 storage. NNDescent is primarily a KNN graph construction algorithm; the resulting graph can be searched similarly to HNSW or NSG.
+
+```cpp
+IndexNNDescentFlat(int d, int K, MetricType metric = METRIC_L2);
+```
+
+<ParamField path="d" type="int" required>
+  Dimensionality of the input vectors.
+</ParamField>
+
+<ParamField path="K" type="int" required>
+  Number of neighbors per node in the KNN graph. Default: `32`.
+</ParamField>
+
+<ParamField path="metric" type="MetricType">
+  Distance metric. Default: `METRIC_L2`.
+</ParamField>
+
+```python
+import faiss
+
+d = 64
+K = 32  # neighbors per node
+index = faiss.IndexNNDescentFlat(d, K)
+index.add(xb)
+D, I = index.search(xq, 4)
+```
+
+<Tip>
+  `IndexNNDescentFlat` is mainly used as a building block for NSG graph construction (`build_type = 1` in `IndexNSGFlat`). For production search use cases, prefer `IndexHNSWFlat` or `IndexNSGFlat`.
+</Tip>

@@ -1,0 +1,264 @@
+---
+title: 'GPU indexes'
+description: 'Run Faiss indexes on one or more NVIDIA GPUs for dramatically faster search and clustering.'
+---
+
+Faiss GPU indexes are drop-in replacements for their CPU counterparts. The same `add`, `train`, and `search` API applies; only construction differs. GPU indexes can be 5–10× faster than CPU for flat search and provide large throughput gains for IVF-based indexes.
+
+## Prerequisites
+
+- NVIDIA GPU with CUDA compute capability ≥ 7.0
+- CUDA toolkit installed and on `PATH`
+- `faiss-gpu` conda package:
+
+```bash
+conda install -c pytorch faiss-gpu
+```
+
+---
+
+## Single GPU with StandardGpuResources
+
+`StandardGpuResources` manages GPU memory (temporary workspace, cuBLAS handles, streams) for one or more indexes on a single device. Create one instance per process; share it across indexes on the same GPU.
+
+<Steps>
+  <Step title="Set up data">
+    ```python
+    import numpy as np
+
+    d = 64                           # dimension
+    nb = 100000                      # database size
+    nq = 10000                       # nb of queries
+    np.random.seed(1234)             # make reproducible
+    xb = np.random.random((nb, d)).astype('float32')
+    xb[:, 0] += np.arange(nb) / 1000.
+    xq = np.random.random((nq, d)).astype('float32')
+    xq[:, 0] += np.arange(nq) / 1000.
+    ```
+  </Step>
+  <Step title="Create GPU resources and move the index">
+    Build a CPU flat index, then transfer it to the GPU with `index_cpu_to_gpu`. The returned object is a `GpuIndexFlatL2` — a full drop-in for `IndexFlatL2`.
+
+    ```python
+    import faiss                     # make faiss available
+
+    res = faiss.StandardGpuResources()  # use a single GPU
+
+    index_flat = faiss.IndexFlatL2(d)   # build a flat (CPU) index
+
+    # make it a flat GPU index
+    gpu_index_flat = faiss.index_cpu_to_gpu(res, 0, index_flat)
+    ```
+
+    The second argument (`0`) is the GPU device index.
+  </Step>
+  <Step title="Add vectors and search">
+    `GpuIndexFlatL2` behaves identically to `IndexFlatL2`:
+
+    ```python
+    gpu_index_flat.add(xb)         # add vectors to the index
+    print(gpu_index_flat.ntotal)
+
+    k = 4                          # we want to see 4 nearest neighbors
+    D, I = gpu_index_flat.search(xq, k)  # actual search
+    print(I[:5])                   # neighbors of the 5 first queries
+    print(I[-5:])                  # neighbors of the 5 last queries
+    ```
+  </Step>
+  <Step title="GPU IVF index (optional)">
+    IVF indexes are also supported. Build the CPU index, then convert:
+
+    ```python
+    nlist = 100
+    quantizer = faiss.IndexFlatL2(d)  # the other index
+    index_ivf = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
+
+    # make it an IVF GPU index
+    gpu_index_ivf = faiss.index_cpu_to_gpu(res, 0, index_ivf)
+
+    assert not gpu_index_ivf.is_trained
+    gpu_index_ivf.train(xb)        # train on GPU
+    assert gpu_index_ivf.is_trained
+
+    gpu_index_ivf.add(xb)          # add vectors to the index
+    print(gpu_index_ivf.ntotal)
+
+    k = 4
+    D, I = gpu_index_ivf.search(xq, k)  # actual search
+    print(I[:5])
+    print(I[-5:])
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+`StandardGpuResources` allocates a fixed temporary memory pool (up to 1.5 GiB by default, scaled to GPU size). To customize, call `res.setTempMemory(size_in_bytes)` before constructing indexes. Pass `0` to disable the pool and use `cudaMalloc`/`cudaFree` per request.
+</Tip>
+
+---
+
+## Multiple GPUs
+
+Faiss can spread an index across all available GPUs automatically. Queries are sharded across devices and results merged on the CPU.
+
+<Steps>
+  <Step title="Detect GPUs">
+    ```python
+    import faiss
+    import numpy as np
+
+    d = 64
+    nb = 100000
+    nq = 10000
+    np.random.seed(1234)
+    xb = np.random.random((nb, d)).astype('float32')
+    xb[:, 0] += np.arange(nb) / 1000.
+    xq = np.random.random((nq, d)).astype('float32')
+    xq[:, 0] += np.arange(nq) / 1000.
+
+    ngpus = faiss.get_num_gpus()
+    print("number of GPUs:", ngpus)
+    ```
+  </Step>
+  <Step title="Replicate the index across all GPUs">
+    `index_cpu_to_all_gpus` creates an `IndexReplicas` that holds one copy of the index per GPU. Queries are distributed round-robin.
+
+    ```python
+    cpu_index = faiss.IndexFlatL2(d)
+
+    gpu_index = faiss.index_cpu_to_all_gpus(  # build the index
+        cpu_index
+    )
+
+    gpu_index.add(xb)              # add vectors to the index
+    print(gpu_index.ntotal)
+
+    k = 4
+    D, I = gpu_index.search(xq, k) # actual search
+    print(I[:5])                   # neighbors of the 5 first queries
+    print(I[-5:])                  # neighbors of the 5 last queries
+    ```
+  </Step>
+</Steps>
+
+To replicate across a specific subset of GPUs, use `index_cpu_to_gpus_list`:
+
+```python
+# Use GPUs 0 and 2 only
+gpu_index = faiss.index_cpu_to_gpus_list(cpu_index, gpus=[0, 2])
+```
+
+<Note>
+`IndexReplicas` replicates the full index on each GPU. For very large indexes, use `IndexShards` to shard the data — see [Scaling to large datasets](/guides/scaling).
+</Note>
+
+---
+
+## GPU IVF indexes
+
+When converting an IVF index to GPU, Faiss automatically selects `GpuIndexIVFFlat` or `GpuIndexIVFPQ`. You can also construct them directly using `GpuIndexIVFFlatConfig`:
+
+<Tabs>
+  <Tab title="Python (via conversion)">
+    ```python
+    import faiss
+
+    res = faiss.StandardGpuResources()
+    d = 64
+    nlist = 100
+
+    # Build CPU IVF index and convert
+    quantizer = faiss.IndexFlatL2(d)
+    index_ivf = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
+    gpu_index_ivf = faiss.index_cpu_to_gpu(res, 0, index_ivf)
+
+    gpu_index_ivf.train(xb)
+    gpu_index_ivf.add(xb)
+    D, I = gpu_index_ivf.search(xq, 4)
+    ```
+  </Tab>
+  <Tab title="C++ (direct construction)">
+    ```cpp
+    #include <faiss/gpu/GpuIndexIVFFlat.h>
+    #include <faiss/gpu/StandardGpuResources.h>
+
+    faiss::gpu::StandardGpuResources res;
+
+    int nlist = 100;
+    faiss::gpu::GpuIndexIVFFlat index_ivf(&res, d, nlist, faiss::METRIC_L2);
+
+    assert(!index_ivf.is_trained);
+    index_ivf.train(nb, xb);
+    assert(index_ivf.is_trained);
+    index_ivf.add(nb, xb);
+
+    long* I = new long[k * nq];
+    float* D = new float[k * nq];
+    index_ivf.search(nq, xq, k, D, I);
+
+    delete[] I;
+    delete[] D;
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Moving indexes between CPU and GPU
+
+Faiss provides symmetric conversion functions so you can build or train on CPU and search on GPU, or vice versa.
+
+| Function | Direction | Notes |
+|----------|-----------|-------|
+| `faiss.index_cpu_to_gpu(res, device, index)` | CPU → single GPU | Returns a GPU index |
+| `faiss.index_cpu_to_all_gpus(index)` | CPU → all GPUs | Returns `IndexReplicas` |
+| `faiss.index_cpu_to_gpus_list(index, gpus=[...])` | CPU → GPU subset | Returns `IndexReplicas` |
+| `faiss.index_cpu_to_gpu_multiple(vres, vdev, index)` | CPU → multiple GPUs | Manual control |
+| `faiss.index_gpu_to_cpu(index)` | GPU → CPU | Transfers data back |
+
+**Example round-trip — train on CPU, search on GPU:**
+
+```python
+import faiss
+
+res = faiss.StandardGpuResources()
+
+# Build and train on CPU
+quantizer = faiss.IndexFlatL2(d)
+cpu_index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
+cpu_index.train(xb)
+cpu_index.add(xb)
+
+# Move trained index to GPU for fast search
+gpu_index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
+D, I = gpu_index.search(xq, k)
+
+# Retrieve back to CPU for serialization
+cpu_index_back = faiss.index_gpu_to_cpu(gpu_index)
+faiss.write_index(cpu_index_back, "my_index.faiss")
+```
+
+<Warning>
+Only CPU indexes can be serialized with `write_index`. Always call `index_gpu_to_cpu` before saving.
+</Warning>
+
+---
+
+## Tips
+
+**GPU memory:**
+- Each `StandardGpuResources` instance pre-allocates a temporary memory pool scaled to GPU VRAM (never more than 1.5 GiB).
+- Call `res.noTempMemory()` to eliminate the pool and pay per-allocation; useful for small indexes.
+- Monitor usage with `res.getMemoryInfo()`.
+
+**Temporary memory:**
+- Flat search uses temporary GPU memory proportional to `nq × nb × 4` bytes. For very large `nb` and `nq`, this can exceed VRAM.
+- IVF search is more memory-efficient because only `nprobe` cells are loaded per query.
+
+**Stream handling:**
+- By default, Faiss issues work on its own internal CUDA stream.
+- To interoperate with PyTorch or another CUDA library, call `res.setDefaultStream(device, stream)` with the shared stream.
+- Call `res.revertDefaultStream(device)` to restore Faiss's own stream.
+
+**Pinned memory:**
+- Async CPU–GPU transfers use pinned (page-locked) host memory. Increase the allocation with `res.setPinnedMemory(size_in_bytes)` to improve transfer throughput.

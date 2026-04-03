@@ -1,0 +1,326 @@
+---
+title: "Flat indexes"
+description: "Exact nearest neighbor search indexes"
+---
+
+Flat indexes store all vectors as-is and perform exhaustive search over the entire dataset. They always return exact nearest neighbors and require no training. Because every query compares against every stored vector, they are best suited for datasets up to a few million vectors where search latency is acceptable, or as coarse quantizers inside IVF indexes.
+
+## Memory usage comparison
+
+| Index type | Bytes per dimension per vector | Bytes per vector (d=128) |
+|---|---|---|
+| `IndexFlatL2` / `IndexFlatIP` | 4 bytes (float32) | 512 B |
+| `IndexScalarQuantizer` (QT_8bit) | 1 byte | 128 B |
+| `IndexScalarQuantizer` (QT_4bit) | 0.5 bytes | 64 B |
+| `IndexScalarQuantizer` (QT_fp16) | 2 bytes | 256 B |
+| `IndexPQ` (M=8, nbits=8) | M bytes total | 8 B |
+
+---
+
+## IndexFlatL2
+
+Stores raw float32 vectors and computes exact L2 (Euclidean) distances. The simplest and most reliable index — use it as a baseline and as a coarse quantizer for IVF indexes.
+
+```cpp
+explicit IndexFlatL2(idx_t d);
+```
+
+<ParamField path="d" type="idx_t" required>
+  Dimensionality of the input vectors.
+</ParamField>
+
+**When to use:** Small datasets (< 1M vectors), ground-truth computation, coarse quantizer for IVF indexes.
+
+<Tabs>
+  <Tab title="Python">
+    ```python
+    import numpy as np
+    import faiss
+
+    d = 64                            # vector dimension
+    nb = 100000                       # database size
+    nq = 10000                        # number of queries
+
+    np.random.seed(1234)
+    xb = np.random.random((nb, d)).astype('float32')
+    xq = np.random.random((nq, d)).astype('float32')
+
+    index = faiss.IndexFlatL2(d)      # build the index
+    print(index.is_trained)           # True — no training needed
+
+    index.add(xb)                     # add vectors
+    print(index.ntotal)               # 100000
+
+    k = 4
+    D, I = index.search(xq, k)       # search: D = distances, I = indices
+    print(I[:5])                      # nearest neighbors for first 5 queries
+    ```
+  </Tab>
+  <Tab title="C++">
+    ```cpp
+    #include <faiss/IndexFlat.h>
+
+    int d = 64;
+    int nb = 100000;
+
+    // build and populate the index
+    faiss::IndexFlatL2 index(d);
+    index.add(nb, xb);  // xb: float array of shape (nb, d)
+
+    // search
+    int k = 4;
+    std::vector<faiss::idx_t> I(k * nq);
+    std::vector<float> D(k * nq);
+    index.search(nq, xq, k, D.data(), I.data());
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  `IndexFlatL2` maintains an optional cache of precomputed L2 norms (`cached_l2norms`) that can accelerate distance computations when using dot-product acceleration. Call `sync_l2norms()` after all `add()` calls to populate it, and `clear_l2norms()` to free it.
+</Note>
+
+---
+
+## IndexFlatIP
+
+Stores raw float32 vectors and computes exact inner product (dot product) distances. For cosine similarity, normalize your vectors before adding them to the index.
+
+```cpp
+explicit IndexFlatIP(idx_t d);
+```
+
+<ParamField path="d" type="idx_t" required>
+  Dimensionality of the input vectors.
+</ParamField>
+
+**When to use:** Maximum inner product search (MIPS), cosine similarity with pre-normalized vectors.
+
+```python
+import faiss
+import numpy as np
+
+d = 128
+index = faiss.IndexFlatIP(d)
+
+# For cosine similarity: normalize vectors first
+xb = np.random.random((10000, d)).astype('float32')
+faiss.normalize_L2(xb)         # in-place L2 normalization
+
+index.add(xb)
+
+xq = np.random.random((100, d)).astype('float32')
+faiss.normalize_L2(xq)
+
+D, I = index.search(xq, 4)    # D = inner products (higher is closer)
+```
+
+<Tip>
+  Inner product search returns higher values for closer vectors (it is a similarity, not a distance). When interpreting results, the first neighbor of a vector against itself should have an inner product of 1.0 if normalized.
+</Tip>
+
+---
+
+## IndexFlat
+
+Base class for all flat indexes. Stores raw float32 vectors and performs exhaustive search using the specified metric type. Prefer `IndexFlatL2` or `IndexFlatIP` for clarity; use `IndexFlat` directly when you need to specify the metric at runtime.
+
+```cpp
+explicit IndexFlat(idx_t d, MetricType metric = METRIC_L2);
+```
+
+<ParamField path="d" type="idx_t" required>
+  Dimensionality of the input vectors.
+</ParamField>
+
+<ParamField path="metric" type="MetricType">
+  Distance metric. Options: `METRIC_L2` (default), `METRIC_INNER_PRODUCT`, `METRIC_L1`, `METRIC_Linf`, `METRIC_Lp`, `METRIC_Canberra`, `METRIC_BrayCurtis`, `METRIC_JensenShannon`.
+</ParamField>
+
+```python
+import faiss
+
+d = 64
+# Equivalent to IndexFlatL2(d)
+index = faiss.IndexFlat(d, faiss.METRIC_L2)
+
+# Equivalent to IndexFlatIP(d)
+index_ip = faiss.IndexFlat(d, faiss.METRIC_INNER_PRODUCT)
+```
+
+---
+
+## IndexFlatCodes
+
+Abstract base class for all flat indexes that store vectors as fixed-size byte codes. Direct subclasses include `IndexFlat`, `IndexScalarQuantizer`, and `IndexPQ`. You will not typically instantiate this class directly.
+
+Key fields:
+- `code_size` — number of bytes per stored vector code
+- `codes` — the raw byte storage (`MaybeOwnedVector<uint8_t>`)
+
+---
+
+## IndexScalarQuantizer
+
+A flat index that compresses each vector component using a scalar quantizer. Trades a small amount of recall for significant memory reduction. Training is required to learn the quantization range.
+
+```cpp
+IndexScalarQuantizer(
+    int d,
+    ScalarQuantizer::QuantizerType qtype,
+    MetricType metric = METRIC_L2);
+```
+
+<ParamField path="d" type="int" required>
+  Dimensionality of the input vectors.
+</ParamField>
+
+<ParamField path="qtype" type="ScalarQuantizer::QuantizerType" required>
+  Quantizer type controlling the bit-depth and encoding scheme. See the table below.
+</ParamField>
+
+<ParamField path="metric" type="MetricType">
+  Distance metric. Default: `METRIC_L2`.
+</ParamField>
+
+**Quantizer types:**
+
+| `qtype` value | Bits per component | Notes |
+|---|---|---|
+| `QT_8bit` | 8 | Per-dimension range, highest accuracy |
+| `QT_4bit` | 4 | Per-dimension range, 2× compression vs 8bit |
+| `QT_8bit_uniform` | 8 | Shared range across all dimensions |
+| `QT_4bit_uniform` | 4 | Shared range across all dimensions |
+| `QT_fp16` | 16 | Half-precision float, minimal quality loss |
+| `QT_bf16` | 16 | Brain float (bfloat16) |
+| `QT_6bit` | 6 | Per-dimension range |
+| `QT_8bit_direct` | 8 | Fast encoding for uint8 data |
+
+**When to use:** When you need exact-ish search with lower memory than `IndexFlatL2`, and can tolerate a small recall loss.
+
+```python
+import faiss
+import numpy as np
+
+d = 128
+nb = 100000
+xb = np.random.random((nb, d)).astype('float32')
+
+# 8-bit scalar quantization: ~4x memory reduction vs float32
+index = faiss.IndexScalarQuantizer(d, faiss.ScalarQuantizer.QT_8bit)
+index.train(xb)       # learns per-dimension [min, max] range
+index.add(xb)
+
+D, I = index.search(xb[:5], 4)
+```
+
+<Warning>
+  `IndexScalarQuantizer` requires training before adding vectors. Calling `add()` before `train()` will raise an error.
+</Warning>
+
+---
+
+## IndexPQ
+
+A flat index that encodes each vector using Product Quantization (PQ). Vectors are split into `M` sub-vectors, each encoded with `nbits` bits. This achieves aggressive compression (as low as 8 bytes per vector regardless of dimensionality) at the cost of reduced recall.
+
+```cpp
+IndexPQ(int d, size_t M, size_t nbits, MetricType metric = METRIC_L2);
+```
+
+<ParamField path="d" type="int" required>
+  Dimensionality of the input vectors. Must be divisible by `M`.
+</ParamField>
+
+<ParamField path="M" type="size_t" required>
+  Number of sub-quantizers (sub-vectors). Each sub-vector has dimension `d / M`. Higher `M` gives better recall but more memory.
+</ParamField>
+
+<ParamField path="nbits" type="size_t" required>
+  Number of bits per sub-vector index. Typically `8` (256 centroids per sub-quantizer). Common values: 4, 8.
+</ParamField>
+
+<ParamField path="metric" type="MetricType">
+  Distance metric. Default: `METRIC_L2`.
+</ParamField>
+
+**Memory per vector:** `M * nbits / 8` bytes. For example, `IndexPQ(128, 16, 8)` uses 16 bytes per vector regardless of the 128-dimensional input.
+
+**When to use:** Very large datasets where RAM is the bottleneck and you can accept lower recall. Commonly used as a second stage in `IndexIVFPQ`.
+
+```python
+import faiss
+import numpy as np
+
+d = 128
+nb = 200000
+xb = np.random.random((nb, d)).astype('float32')
+
+m = 16        # 16 sub-quantizers
+nbits = 8     # 8 bits per sub-quantizer → 16 bytes/vector
+
+index = faiss.IndexPQ(d, m, nbits)
+index.train(xb)   # trains the PQ codebooks
+index.add(xb)
+
+D, I = index.search(xb[:5], 4)
+```
+
+<Accordion title="Choosing M and nbits">
+  - `M` must divide `d` evenly. For `d=128`, valid values include 4, 8, 16, 32, 64.
+  - `nbits=8` (256 centroids) is the most common choice and gives good quality. `nbits=4` (16 centroids) halves memory again but reduces recall significantly.
+  - The number of training vectors should be at least `256 * M` for `nbits=8` to ensure enough data per centroid.
+</Accordion>
+
+---
+
+## IndexPQFastScan
+
+A SIMD-optimized variant of `IndexPQ` that reorganizes PQ codes into blocks for fast distance table lookups. Currently supports 4-bit PQ (`nbits=4`). Provides substantially higher search throughput on modern CPUs with AVX2/AVX-512.
+
+```cpp
+IndexPQFastScan(
+    int d,
+    size_t M,
+    size_t nbits,
+    MetricType metric = METRIC_L2,
+    int bbs = 32);
+```
+
+<ParamField path="d" type="int" required>
+  Dimensionality of the input vectors.
+</ParamField>
+
+<ParamField path="M" type="size_t" required>
+  Number of sub-quantizers.
+</ParamField>
+
+<ParamField path="nbits" type="size_t" required>
+  Bits per sub-quantizer. Must be `4` for the fast-scan implementation.
+</ParamField>
+
+<ParamField path="metric" type="MetricType">
+  Distance metric. Default: `METRIC_L2`.
+</ParamField>
+
+<ParamField path="bbs" type="int">
+  Block size for SIMD scanning. Default: `32`. Must be a multiple of 32.
+</ParamField>
+
+**When to use:** Same scenarios as `IndexPQ` when CPU throughput is critical and `nbits=4` is acceptable.
+
+```python
+import faiss
+import numpy as np
+
+d = 128
+nb = 200000
+xb = np.random.random((nb, d)).astype('float32')
+
+# 4-bit PQ with fast scan
+index = faiss.IndexPQFastScan(d, 32, 4)
+index.train(xb)
+index.add(xb)
+
+D, I = index.search(xb[:5], 4)
+```

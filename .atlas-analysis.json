@@ -1,0 +1,90 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "Faiss",
+  "projectDescription": "A high-performance library for efficient similarity search and clustering of dense vectors, with CPU and GPU support.",
+  "theme": "aspen",
+  "primaryColor": "#0064E0",
+  "lightColor": "#E8F0FE",
+  "darkColor": "#003A8C",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": ["introduction", "quickstart"]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/indexes-overview",
+              "concepts/metrics-and-distances",
+              "concepts/quantization"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/cpu-indexes",
+              "guides/gpu-indexes",
+              "guides/clustering",
+              "guides/index-io",
+              "guides/scaling"
+            ]
+          },
+          {
+            "group": "Advanced Topics",
+            "pages": [
+              "advanced/auto-tuning",
+              "advanced/contrib-modules",
+              "advanced/benchmarking"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Index Reference",
+        "groups": [
+          {
+            "group": "Index Types",
+            "pages": [
+              "reference/flat-indexes",
+              "reference/ivf-indexes",
+              "reference/graph-indexes",
+              "reference/binary-indexes",
+              "reference/gpu-indexes"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Exact and approximate nearest neighbor search for dense float vectors",
+    "Inverted file (IVF) indexes for scalable billion-scale search",
+    "Product quantization (PQ) and scalar quantization for compressed storage",
+    "HNSW and NSG graph-based indexes for fast approximate search",
+    "GPU-accelerated indexes (CUDA) for maximum throughput",
+    "K-means clustering with CPU and GPU support",
+    "Index factory string API for declarative index construction",
+    "Auto-tuning framework for optimizing search parameters",
+    "Python/NumPy bindings with full C++ API parity",
+    "On-disk and distributed index support via contrib modules"
+  ],
+  "publicApiSurface": [
+    "faiss.IndexFlatL2 / faiss.IndexFlatIP",
+    "faiss.IndexIVFFlat",
+    "faiss.IndexIVFPQ",
+    "faiss.IndexHNSWFlat",
+    "faiss.IndexNSGFlat",
+    "faiss.IndexBinaryFlat / faiss.IndexBinaryIVF",
+    "faiss.GpuIndexFlatL2 / faiss.GpuIndexIVFFlat / faiss.GpuIndexIVFPQ",
+    "faiss.index_factory(d, description, metric)",
+    "faiss.write_index / faiss.read_index",
+    "faiss.Kmeans",
+    "faiss.AutoTuneCriterion / faiss.ParameterSpace",
+    "faiss.normalize_L2",
+    "faiss.knn / faiss.pairwise_distances"
+  ]
+}

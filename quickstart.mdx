@@ -1,80 +1,300 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: "Quick Start"
+description: "Install Faiss and run your first similarity search in a few lines of Python or C++."
 ---
 
-## Get started in three steps
+## Installation
 
-Get your documentation site running locally and make your first customization.
+Faiss is distributed as precompiled conda packages. Choose the variant that matches your hardware.
 
-### Step 1: Set up your local environment
+<CodeGroup>
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+```bash CPU only
+conda install -c pytorch -c conda-forge faiss-cpu=1.14.1
+```
 
-### Step 2: Deploy your changes
+```bash GPU (CUDA)
+conda install -c pytorch -c nvidia -c conda-forge faiss-gpu=1.14.1
+```
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+```bash GPU with NVIDIA cuVS
+conda install -c pytorch -c nvidia -c rapidsai -c conda-forge libnvjitlink faiss-gpu-cuvs=1.14.1
+```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+</CodeGroup>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+<Note>
+  The `conda-forge` channel is required for up-to-date BLAS dependencies (Intel MKL on x86-64, OpenBLAS on ARM). For `faiss-gpu`, the `nvidia` channel is additionally required for CUDA. See [INSTALL.md](https://github.com/facebookresearch/faiss/blob/main/INSTALL.md) for building from source with CMake.
+</Note>
 
-### Step 3: Go live
+<Tip>
+  `faiss-cpu` is available on Linux (x86-64 and aarch64), macOS (arm64), and Windows (x86-64). `faiss-gpu` requires Linux x86-64 with CUDA 11.4 or 12.1.
+</Tip>
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+## Your first search
+
+The following example builds an exact flat index (`IndexFlatL2`) over 100,000 random 64-dimensional vectors and searches for the 4 nearest neighbors of 10,000 query vectors.
+
+<Steps>
+
+<Step title="Generate some vectors">
+
+Faiss works with 32-bit float arrays. Here we generate a database `xb` and a query set `xq`, both of dimension `d = 64`.
+
+<Tabs>
+
+<Tab title="Python">
+
+```python
+import numpy as np
+
+d = 64                           # dimension
+nb = 100000                      # database size
+nq = 10000                       # nb of queries
+np.random.seed(1234)             # make reproducible
+xb = np.random.random((nb, d)).astype('float32')
+xb[:, 0] += np.arange(nb) / 1000.
+xq = np.random.random((nq, d)).astype('float32')
+xq[:, 0] += np.arange(nq) / 1000.
+```
+
+</Tab>
+
+<Tab title="C++">
+
+```cpp
+#include <cstdio>
+#include <cstdlib>
+#include <random>
+
+#include <faiss/IndexFlat.h>
+
+using idx_t = faiss::idx_t;
+
+int main() {
+    int d = 64;      // dimension
+    int nb = 100000; // database size
+    int nq = 10000;  // nb of queries
+
+    std::mt19937 rng;
+    std::uniform_real_distribution<> distrib;
+
+    float* xb = new float[d * nb];
+    float* xq = new float[d * nq];
+
+    for (int i = 0; i < nb; i++) {
+        for (int j = 0; j < d; j++)
+            xb[d * i + j] = distrib(rng);
+        xb[d * i] += i / 1000.;
+    }
+
+    for (int i = 0; i < nq; i++) {
+        for (int j = 0; j < d; j++)
+            xq[d * i + j] = distrib(rng);
+        xq[d * i] += i / 1000.;
+    }
+```
+
+</Tab>
+
+</Tabs>
+
+</Step>
+
+<Step title="Build the index and add vectors">
+
+`IndexFlatL2` performs exact L2 nearest-neighbor search. It requires no training — vectors can be added immediately.
+
+<Tabs>
+
+<Tab title="Python">
+
+```python
+import faiss                   # make faiss available
+index = faiss.IndexFlatL2(d)   # build the index
+print(index.is_trained)        # True — flat indexes need no training
+index.add(xb)                  # add vectors to the index
+print(index.ntotal)            # 100000
+```
+
+</Tab>
+
+<Tab title="C++">
+
+```cpp
+    faiss::IndexFlatL2 index(d); // call constructor
+    printf("is_trained = %s\n", index.is_trained ? "true" : "false");
+    index.add(nb, xb);           // add vectors to the index
+    printf("ntotal = %zd\n", index.ntotal);
+```
+
+</Tab>
+
+</Tabs>
+
+</Step>
+
+<Step title="Search">
+
+`index.search(queries, k)` returns two arrays: `D` (distances) and `I` (integer indices of nearest neighbors), both of shape `(nq, k)`.
+
+<Tabs>
+
+<Tab title="Python">
+
+```python
+k = 4                          # we want to see 4 nearest neighbors
+D, I = index.search(xb[:5], k) # sanity check
+print(I)
+print(D)
+D, I = index.search(xq, k)     # actual search
+print(I[:5])                   # neighbors of the 5 first queries
+print(I[-5:])                  # neighbors of the 5 last queries
+```
+
+</Tab>
+
+<Tab title="C++">
+
+```cpp
+    int k = 4;
+
+    { // sanity check: search 5 first vectors of xb
+        idx_t* I = new idx_t[k * 5];
+        float* D = new float[k * 5];
+
+        index.search(5, xb, k, D, I);
+
+        printf("I=\n");
+        for (int i = 0; i < 5; i++) {
+            for (int j = 0; j < k; j++)
+                printf("%5zd ", I[i * k + j]);
+            printf("\n");
+        }
+
+        printf("D=\n");
+        for (int i = 0; i < 5; i++) {
+            for (int j = 0; j < k; j++)
+                printf("%7g ", D[i * k + j]);
+            printf("\n");
+        }
+
+        delete[] I;
+        delete[] D;
+    }
+
+    { // search xq
+        idx_t* I = new idx_t[k * nq];
+        float* D = new float[k * nq];
+
+        index.search(nq, xq, k, D, I);
+
+        printf("I (5 first results)=\n");
+        for (int i = 0; i < 5; i++) {
+            for (int j = 0; j < k; j++)
+                printf("%5zd ", I[i * k + j]);
+            printf("\n");
+        }
+
+        printf("D (5 last results)=\n");
+        for (int i = nq - 5; i < nq; i++) {
+            for (int j = 0; j < k; j++)
+                printf("%5f ", D[i * k + j]);
+            printf("\n");
+        }
+
+        delete[] I;
+        delete[] D;
+    }
+
+    delete[] xb;
+    delete[] xq;
+    return 0;
+}
+```
+
+</Tab>
+
+</Tabs>
+
+The sanity check searches the first 5 database vectors against themselves, so the first result for each should be the vector itself (distance 0).
+
+</Step>
+
+</Steps>
+
+## Faster approximate search
+
+`IndexFlatL2` scans every vector in the database — it gives exact results but does not scale to very large datasets. `IndexIVFFlat` partitions the database into `nlist` Voronoi cells and only searches the `nprobe` nearest cells at query time, making search much faster at a small accuracy cost.
+
+```python
+import numpy as np
+import faiss
+
+d = 64                           # dimension
+nb = 100000                      # database size
+nq = 10000                       # nb of queries
+np.random.seed(1234)             # make reproducible
+xb = np.random.random((nb, d)).astype('float32')
+xb[:, 0] += np.arange(nb) / 1000.
+xq = np.random.random((nq, d)).astype('float32')
+xq[:, 0] += np.arange(nq) / 1000.
+
+nlist = 100
+k = 4
+quantizer = faiss.IndexFlatL2(d)  # the other index
+index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
+# here we specify METRIC_L2, by default it performs inner-product search
+
+assert not index.is_trained
+index.train(xb)
+assert index.is_trained
+
+index.add(xb)                  # add may be a bit slower as well
+D, I = index.search(xq, k)     # actual search
+print(I[-5:])                  # neighbors of the 5 last queries
+index.nprobe = 10              # default nprobe is 1, try a few more
+D, I = index.search(xq, k)
+print(I[-5:])                  # neighbors of the 5 last queries
+```
+
+<Warning>
+  IVF indexes must be trained on a representative sample of your data before vectors can be added. Call `index.train(xb)` before `index.add(xb)`.
+</Warning>
+
+Increasing `nprobe` improves recall at the cost of speed. `nprobe = 1` is the fastest but least accurate; `nprobe = nlist` is equivalent to an exact flat search.
+
+## Using `index_factory`
+
+The `index_factory` function constructs indexes from a string descriptor, avoiding the need to manually wire together quantizer and index objects:
+
+```python
+# Equivalent to the IVFFlat example above
+index = faiss.index_factory(64, "IVF100,Flat")
+
+# IVF with Product Quantization — more memory-efficient
+index = faiss.index_factory(64, "IVF100,PQ8")
+```
+
+The string format is `"<preprocessing>,<index_type>"`. This is the recommended way to build complex composite indexes.
+
+<Tip>
+  Use `faiss.index_factory` when experimenting with different index types. It makes it easy to swap between `IVF100,Flat`, `IVF100,PQ8`, `HNSW32`, and others without changing surrounding code.
+</Tip>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Indexes overview" icon="database" href="/concepts/indexes-overview">
+    Understand every index type and how to choose the right one for your use case.
+  </Card>
+  <Card title="CPU indexes guide" icon="microchip" href="/guides/cpu-indexes">
+    Deep dive into IVF, HNSW, PQ, and other CPU index configurations.
+  </Card>
+  <Card title="GPU indexes guide" icon="bolt" href="/guides/gpu-indexes">
+    Move indexes to GPU with `index_cpu_to_gpu` for maximum search throughput.
+  </Card>
+  <Card title="index_factory reference" icon="wrench" href="/concepts/indexes-overview">
+    Full reference for index factory string descriptors and composite index pipelines.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

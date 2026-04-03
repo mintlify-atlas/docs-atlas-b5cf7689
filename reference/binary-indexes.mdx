@@ -1,0 +1,291 @@
+---
+title: "Binary indexes"
+description: "Indexes for binary (Hamming distance) search"
+---
+
+Binary indexes operate on bit-packed vectors and compute Hamming distances (number of differing bits). They use the `IndexBinary` base class rather than `Index`, and all vector data is passed as `uint8` arrays where each byte encodes 8 dimensions.
+
+## Input format
+
+Binary vectors are stored as arrays of `uint8_t`. A vector with `d` bits requires `d / 8` bytes. The dimension `d` passed to binary index constructors is always in **bits**.
+
+```python
+import numpy as np
+
+d = 256          # 256-bit vectors
+nb = 10000
+
+# Each vector is d/8 = 32 bytes
+vectors = np.random.randint(0, 256, (nb, d // 8)).astype('uint8')
+```
+
+## Distance semantics
+
+Search returns Hamming distances as `int32` values (not `float32`). A distance of `0` means identical vectors; the maximum possible distance is `d` (all bits differ).
+
+---
+
+## IndexBinaryFlat
+
+Stores all binary vectors and performs exhaustive Hamming distance search. Returns exact nearest neighbors.
+
+```cpp
+explicit IndexBinaryFlat(idx_t d);
+```
+
+<ParamField path="d" type="idx_t" required>
+  Dimensionality of the binary vectors **in bits**. Must be a multiple of 8.
+</ParamField>
+
+**When to use:** Small datasets or ground-truth computation. No training required.
+
+```python
+import faiss
+import numpy as np
+
+d = 256                 # bits
+nb = 10000
+nq = 100
+
+np.random.seed(42)
+vectors = np.random.randint(0, 256, (nb, d // 8)).astype('uint8')
+queries  = np.random.randint(0, 256, (nq, d // 8)).astype('uint8')
+
+index = faiss.IndexBinaryFlat(d)
+index.add(vectors)
+print(index.ntotal)     # 10000
+
+k = 4
+D, I = index.search(queries, k)   # D = Hamming distances (int32)
+print(D[:5])
+print(I[:5])
+```
+
+<Note>
+  `IndexBinaryFlat` supports `range_search` with an integer `radius` parameter (Hamming distance threshold).
+</Note>
+
+---
+
+## IndexBinaryIVF
+
+Approximate Hamming search using an IVF partitioning scheme. Vectors are assigned to one of `nlist` clusters at add time; only `nprobe` clusters are searched at query time.
+
+```cpp
+IndexBinaryIVF(
+    IndexBinary* quantizer,
+    size_t d,
+    size_t nlist,
+    bool own_invlists = true);
+```
+
+<ParamField path="quantizer" type="IndexBinary*" required>
+  Binary coarse quantizer that maps binary vectors to inverted lists. Typically `IndexBinaryFlat`.
+</ParamField>
+
+<ParamField path="d" type="size_t" required>
+  Dimensionality in bits. Must be a multiple of 8.
+</ParamField>
+
+<ParamField path="nlist" type="size_t" required>
+  Number of inverted lists (clusters).
+</ParamField>
+
+<ParamField path="own_invlists" type="bool">
+  Whether the index owns the inverted lists. Default: `true`.
+</ParamField>
+
+Key fields:
+- `nprobe` (default: `1`) — Number of clusters to search at query time.
+- `max_codes` (default: `0`, unlimited) — Maximum number of codes to visit per query.
+
+**When to use:** Large binary vector datasets where exhaustive search is too slow. Provides a speed/recall tradeoff controlled by `nprobe`.
+
+```python
+import faiss
+import numpy as np
+
+d = 256
+nb = 100000
+nq = 1000
+
+np.random.seed(42)
+xb = np.random.randint(0, 256, (nb, d // 8)).astype('uint8')
+xq = np.random.randint(0, 256, (nq, d // 8)).astype('uint8')
+
+nlist = 100
+quantizer = faiss.IndexBinaryFlat(d)
+index = faiss.IndexBinaryIVF(quantizer, d, nlist)
+
+index.train(xb)       # trains the binary coarse quantizer
+index.add(xb)
+
+index.nprobe = 10     # search 10 clusters
+k = 4
+D, I = index.search(xq, k)
+print(I[:5])
+```
+
+---
+
+## IndexBinaryHNSW
+
+Graph-based approximate Hamming search using the HNSW algorithm on binary vectors. Offers fast search without training.
+
+```cpp
+explicit IndexBinaryHNSW(int d, int M = 32);
+explicit IndexBinaryHNSW(IndexBinary* storage, int M = 32);
+```
+
+<ParamField path="d" type="int" required>
+  Dimensionality in bits.
+</ParamField>
+
+<ParamField path="M" type="int">
+  Number of connections per HNSW node. Default: `32`. Higher values improve recall at the cost of memory and build time.
+</ParamField>
+
+Key fields (on the embedded `hnsw` struct):
+- `hnsw.efSearch` — Search beam width (default `16`). Higher improves recall.
+- `hnsw.efConstruction` — Construction beam width (default `40`). Higher improves graph quality.
+
+**When to use:** Large binary datasets where approximate results are acceptable and training overhead should be avoided.
+
+```python
+import faiss
+import numpy as np
+
+d = 256
+nb = 50000
+
+xb = np.random.randint(0, 256, (nb, d // 8)).astype('uint8')
+xq = np.random.randint(0, 256, (100, d // 8)).astype('uint8')
+
+index = faiss.IndexBinaryHNSW(d, 32)
+index.hnsw.efConstruction = 40
+index.add(xb)           # no training required
+
+index.hnsw.efSearch = 64
+D, I = index.search(xq, 4)
+print(I)
+```
+
+---
+
+## IndexBinaryHash
+
+Hash-based binary search that uses the first `b` bits of each vector as a hash key into an inverted list. Provides sub-linear search time for small Hamming radius queries.
+
+```cpp
+IndexBinaryHash(int d, int b);
+```
+
+<ParamField path="d" type="int" required>
+  Dimensionality in bits.
+</ParamField>
+
+<ParamField path="b" type="int" required>
+  Number of bits used as the hash key. The hash table has `2^b` possible buckets. Larger `b` produces more specific buckets, reducing the number of candidates but potentially missing results.
+</ParamField>
+
+Key field: `nflip` — number of bit flips to apply to the query hash at search time (for approximate lookup of nearby buckets).
+
+**When to use:** Very large binary datasets when you need sub-millisecond range search with small radius and can tolerate some missed results.
+
+```python
+import faiss
+import numpy as np
+
+d = 256
+b = 10      # 2^10 = 1024 hash buckets
+
+xb = np.random.randint(0, 256, (100000, d // 8)).astype('uint8')
+xq = np.random.randint(0, 256, (100, d // 8)).astype('uint8')
+
+index = faiss.IndexBinaryHash(d, b)
+index.nflip = 2   # probe 2-bit-flip neighbors of the query hash
+index.add(xb)
+
+D, I = index.search(xq, 4)
+```
+
+---
+
+## IndexBinaryMultiHash
+
+Extends `IndexBinaryHash` with multiple independent hash maps. Each of the `nhash` maps uses `b` bits from a different offset. A candidate is retained if it matches in at least one hash map. Achieves better recall than a single hash at higher computational cost.
+
+```cpp
+IndexBinaryMultiHash(int d, int nhash, int b);
+```
+
+<ParamField path="d" type="int" required>
+  Dimensionality in bits.
+</ParamField>
+
+<ParamField path="nhash" type="int" required>
+  Number of independent hash maps.
+</ParamField>
+
+<ParamField path="b" type="int" required>
+  Bits per hash map.
+</ParamField>
+
+```python
+import faiss
+
+d = 256
+index = faiss.IndexBinaryMultiHash(d, nhash=4, b=10)
+index.nflip = 2
+index.add(xb)
+D, I = index.search(xq, 4)
+```
+
+---
+
+## IndexBinaryFromFloat
+
+Wraps a float-based index to operate on binary vectors. Binary query vectors are unpacked bit-by-bit into `{-1, +1}` float components before being passed to the underlying float index. All queries are symmetric.
+
+```cpp
+explicit IndexBinaryFromFloat(Index* index);
+```
+
+<ParamField path="index" type="Index*" required>
+  An existing float index (e.g., `IndexFlatIP`). The wrapper does not take ownership by default.
+</ParamField>
+
+**When to use:** When you want to reuse a float index (e.g., one with GPU acceleration) for binary vectors encoded as bipolar representations.
+
+```python
+import faiss
+
+d_bits = 64   # 64-bit binary vectors
+float_index = faiss.IndexFlatIP(d_bits)  # underlying float index
+
+index = faiss.IndexBinaryFromFloat(float_index)
+index.own_fields = True   # transfer ownership
+
+xb = np.random.randint(0, 256, (1000, d_bits // 8)).astype('uint8')
+index.add(xb)
+
+xq = np.random.randint(0, 256, (10, d_bits // 8)).astype('uint8')
+D, I = index.search(xq, 4)
+```
+
+<Warning>
+  `IndexBinaryFromFloat` performs unpack-to-float conversion on every distance computation. It is primarily a convenience wrapper and is not optimized for throughput. Prefer `IndexBinaryFlat` or `IndexBinaryHNSW` for performance.
+</Warning>
+
+---
+
+## Summary
+
+| Index | Exact | Training | Incremental add | Best for |
+|---|---|---|---|---|
+| `IndexBinaryFlat` | Yes | No | Yes | Small datasets, ground truth |
+| `IndexBinaryIVF` | No (approx) | Yes | Yes | Large datasets, tunable recall |
+| `IndexBinaryHNSW` | No (approx) | No | Yes | Fast search without training |
+| `IndexBinaryHash` | No (approx) | No | Yes | Small-radius range queries |
+| `IndexBinaryMultiHash` | No (approx) | No | Yes | Higher-recall hash search |
+| `IndexBinaryFromFloat` | Depends on backend | Depends | Yes | Reusing float indexes |

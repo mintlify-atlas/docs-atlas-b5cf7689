@@ -1,0 +1,288 @@
+---
+title: 'Using CPU indexes'
+description: 'Choose the right Faiss CPU index for your dataset size, memory budget, and accuracy requirements.'
+---
+
+Faiss provides a family of CPU indexes that trade off between search accuracy, memory use, and query speed. This guide walks through each major index type and helps you choose the right one.
+
+## Exact search with IndexFlatL2 and IndexFlatIP
+
+`IndexFlatL2` performs an exhaustive brute-force scan over all stored vectors using L2 (Euclidean) distance. It requires no training and returns exact nearest neighbors. `IndexFlatIP` does the same using inner-product distance, which is equivalent to cosine similarity when vectors are normalized.
+
+<Steps>
+  <Step title="Generate data">
+    Create your database and query vectors as `float32` numpy arrays with shape `(n, d)`.
+
+    ```python
+    import numpy as np
+
+    d = 64                           # dimension
+    nb = 100000                      # database size
+    nq = 10000                       # nb of queries
+    np.random.seed(1234)             # make reproducible
+    xb = np.random.random((nb, d)).astype('float32')
+    xb[:, 0] += np.arange(nb) / 1000.
+    xq = np.random.random((nq, d)).astype('float32')
+    xq[:, 0] += np.arange(nq) / 1000.
+    ```
+  </Step>
+  <Step title="Build and populate the index">
+    `IndexFlatL2` is always considered trained — you can call `add` immediately.
+
+    ```python
+    import faiss
+
+    index = faiss.IndexFlatL2(d)   # build the index
+    print(index.is_trained)        # True
+    index.add(xb)                  # add vectors to the index
+    print(index.ntotal)            # 100000
+    ```
+  </Step>
+  <Step title="Search">
+    `search` returns the distances `D` and indices `I` of the `k` nearest neighbors for each query.
+
+    ```python
+    k = 4                          # we want to see 4 nearest neighbors
+    D, I = index.search(xb[:5], k) # sanity check
+    print(I)
+    print(D)
+    D, I = index.search(xq, k)     # actual search
+    print(I[:5])                   # neighbors of the 5 first queries
+    print(I[-5:])                  # neighbors of the 5 last queries
+    ```
+  </Step>
+</Steps>
+
+<Note>
+Flat indexes guarantee exact results but scale as O(n) per query. For datasets larger than a few million vectors, consider an approximate index.
+</Note>
+
+To use inner-product distance instead, replace `IndexFlatL2` with `IndexFlatIP`.
+
+---
+
+## Approximate search with IndexIVFFlat
+
+`IndexIVFFlat` partitions the database into `nlist` Voronoi cells and searches only the cells nearest to each query. This gives a large speed-up at the cost of some recall.
+
+**Key parameters:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `nlist` | Number of inverted lists (Voronoi cells). Typical values: 4×√n to 16×√n where n is the database size. |
+| `nprobe` | Number of cells to visit at query time. Higher = better recall, slower search. Default is 1. |
+
+<Steps>
+  <Step title="Create a quantizer and the IVF index">
+    The quantizer assigns vectors to their nearest centroid. It is an `IndexFlatL2` here.
+
+    ```python
+    import faiss
+
+    nlist = 100
+    k = 4
+    quantizer = faiss.IndexFlatL2(d)  # the other index
+    index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
+    # here we specify METRIC_L2, by default it performs inner-product search
+    ```
+  </Step>
+  <Step title="Train the index">
+    IVF indexes must be trained before adding vectors. Training learns the cell centroids.
+
+    ```python
+    assert not index.is_trained
+    index.train(xb)
+    assert index.is_trained
+    ```
+  </Step>
+  <Step title="Add vectors and search">
+    ```python
+    index.add(xb)                  # add may be a bit slower as well
+    D, I = index.search(xq, k)     # actual search
+    print(I[-5:])                  # neighbors of the 5 last queries
+    index.nprobe = 10              # default nprobe is 1, try a few more
+    D, I = index.search(xq, k)
+    print(I[-5:])                  # neighbors of the 5 last queries
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+Start with `nprobe = 1` and increase it until you reach acceptable recall. A value of 10–50 is common for 1M-vector datasets. Recall scales sub-linearly: doubling `nprobe` gives less than double the compute cost, but recall gains diminish.
+</Tip>
+
+---
+
+## Compressed search with IndexIVFPQ
+
+`IndexIVFPQ` combines an IVF structure with Product Quantization (PQ) to compress stored vectors. Each vector is split into `m` sub-vectors and each sub-vector is encoded in `nbits` bits. This dramatically reduces memory at the cost of approximate distances.
+
+**Key parameters:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `m` | Number of sub-quantizers (sub-vectors). Must divide `d` evenly. More sub-vectors = better accuracy, more memory. |
+| `nbits` | Bits per sub-quantizer code. Default is 8, giving 256 centroids per sub-vector. |
+
+<Steps>
+  <Step title="Build the IVFPQ index">
+    ```python
+    import faiss
+
+    nlist = 100
+    m = 8                             # number of sub-quantizers
+    k = 4
+    quantizer = faiss.IndexFlatL2(d)  # this remains the same
+    index = faiss.IndexIVFPQ(quantizer, d, nlist, m, 8)
+                                      # 8 specifies that each sub-vector is encoded as 8 bits
+    ```
+  </Step>
+  <Step title="Train, add, and search">
+    ```python
+    index.train(xb)
+    index.add(xb)
+    D, I = index.search(xb[:5], k)   # sanity check
+    print(I)
+    print(D)
+    index.nprobe = 10                 # make comparable with experiment above
+    D, I = index.search(xq, k)       # search
+    print(I[-5:])
+    ```
+  </Step>
+</Steps>
+
+**Memory calculation:** An IVFPQ index stores each vector as `m` bytes (with `nbits=8`). For 100,000 vectors with `m=8`, that is 800 KB — versus 25.6 MB for the raw float32 vectors.
+
+<Warning>
+PQ compression introduces quantization error. Distances returned by IVFPQ are approximate. If you need exact distances after finding candidates, use an `IndexIVFPQ` followed by a re-ranking step with the raw vectors.
+</Warning>
+
+---
+
+## Graph-based search with HNSW
+
+`IndexHNSWFlat` builds a Hierarchical Navigable Small World graph that enables very fast approximate search with high recall. It requires no training and does not support removing vectors.
+
+<Tabs>
+  <Tab title="Python">
+    ```python
+    import faiss
+
+    # M = 32 is the number of connections per node in the graph
+    index = faiss.IndexHNSWFlat(d, 32)
+    index.add(xb)
+
+    k = 4
+    D, I = index.search(xq, k)
+    print(I[-5:])
+    ```
+  </Tab>
+  <Tab title="C++">
+    ```cpp
+    #include <faiss/IndexHNSW.h>
+
+    using idx_t = faiss::idx_t;
+
+    int d = 64;      // dimension
+    int nb = 100000; // database size
+    int nq = 10000;  // nb of queries
+    int k = 4;
+
+    faiss::IndexHNSWFlat index(d, 32);
+    index.add(nb, xb);
+
+    idx_t* I = new idx_t[k * nq];
+    float* D = new float[k * nq];
+    index.search(nq, xq, k, D, I);
+
+    delete[] I;
+    delete[] D;
+    ```
+  </Tab>
+</Tabs>
+
+**Key parameters:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `M` (second constructor arg) | Number of neighbors per node. Higher M = better recall, more memory, slower build. Typical values: 16–64. |
+| `efSearch` | Beam width during search. Higher = better recall, slower. Set via `index.hnsw.efSearch`. |
+| `efConstruction` | Beam width during graph construction. Set via `index.hnsw.efConstruction`. |
+
+<Note>
+HNSW does not support `remove_ids`. If you need to delete vectors, use `IndexIVFFlat` or maintain a separate tombstone list.
+</Note>
+
+---
+
+## FastScan variant with IndexPQFastScan
+
+`IndexPQFastScan` uses SIMD-accelerated PQ lookup tables to achieve throughputs several times higher than `IndexIVFPQ` on modern CPUs. It is ideal when query batches are large.
+
+```python
+import faiss
+import numpy as np
+
+d = 64                           # dimension
+nb = 100000                      # database size
+nq = 10000                       # nb of queries
+np.random.seed(1234)             # make reproducible
+xb = np.random.random((nb, d)).astype('float32')
+xb[:, 0] += np.arange(nb) / 1000.
+xq = np.random.random((nq, d)).astype('float32')
+xq[:, 0] += np.arange(nq) / 1000.
+
+m = 8         # number of sub-vectors
+k = 4         # number of neighbors to return
+n_bit = 4     # bits per sub-vector code (4 = 16 centroids per sub-vector)
+bbs = 32      # build block size (must satisfy bbs % 32 == 0)
+index = faiss.IndexPQFastScan(d, m, n_bit, faiss.METRIC_L2, bbs)
+
+assert not index.is_trained
+index.train(xb)
+assert index.is_trained
+
+index.add(xb)
+D, I = index.search(xb[:5], k)   # sanity check
+print(I)
+print(D)
+index.nprobe = 10
+D, I = index.search(xq, k)       # search
+print(I[-5:])
+```
+
+<Tip>
+`n_bit=4` halves memory compared to `n_bit=8` (standard PQ) at a modest recall cost. Use `bbs=32` or `bbs=64` depending on your AVX2/AVX-512 support.
+</Tip>
+
+---
+
+## Index selection guide
+
+| Dataset size | Recommended index | Notes |
+|---|---|---|
+| < 1M vectors | `IndexFlatL2` | Exact, no training required |
+| 1M – 10M vectors | `IndexIVFFlat` | Tune `nlist` ≈ 4×√n, `nprobe` 10–50 |
+| 10M – 100M vectors | `IndexIVFPQ` | PQ compression required to fit in RAM |
+| Any size, high recall | `IndexHNSWFlat` | No training, no vector removal |
+| Large batches, CPU speed | `IndexPQFastScan` | SIMD-accelerated, 4-bit codes |
+| > 100M vectors | See [Scaling to large datasets](/guides/scaling) | On-disk inverted lists or sharding |
+
+---
+
+## Tips
+
+**Training:**
+- Provide at least 39 × `nlist` vectors for training (Faiss will warn if fewer are supplied).
+- Training vectors should be representative of the database. Use a random sample if the dataset is large.
+- For IVFPQ, training requires data to learn both the coarse quantizer and the PQ codebooks.
+
+**Adding vectors:**
+- Vectors must be `float32` contiguous numpy arrays (C order).
+- You can call `add` multiple times; vectors are appended.
+- IDs assigned are sequential starting from 0. Use `add_with_ids` with `IndexIVFFlat` if you need custom IDs.
+
+**Setting nprobe:**
+- `nprobe` can be changed at any time between searches.
+- A good starting sweep: `nprobe ∈ {1, 4, 16, 64}` — plot recall vs. query time.
+- For latency-sensitive applications, keep `nprobe` ≤ 32. For offline batch search, use higher values.

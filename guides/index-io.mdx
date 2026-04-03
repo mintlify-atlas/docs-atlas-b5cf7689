@@ -1,0 +1,228 @@
+---
+title: 'Saving and loading indexes'
+description: 'Persist Faiss indexes to disk, serialize them for network transfer, and work with on-disk inverted lists for datasets that exceed RAM.'
+---
+
+Faiss provides several mechanisms for persisting and transferring indexes. The right approach depends on your dataset size and deployment pattern.
+
+---
+
+## write_index and read_index
+
+`faiss.write_index` serializes any CPU index to a file. `faiss.read_index` deserializes it back. The file format is a Faiss-specific binary format — not numpy `.npy` or HDF5.
+
+<Steps>
+  <Step title="Save an index to disk">
+    ```python
+    import faiss
+    import numpy as np
+
+    d = 64
+    nb = 100000
+    xb = np.random.random((nb, d)).astype('float32')
+
+    index = faiss.IndexFlatL2(d)
+    index.add(xb)
+
+    faiss.write_index(index, "my_index.faiss")
+    ```
+  </Step>
+  <Step title="Load the index">
+    ```python
+    index = faiss.read_index("my_index.faiss")
+    print(index.ntotal)   # 100000
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+Only CPU indexes can be serialized. If you have a GPU index, call `faiss.index_gpu_to_cpu(gpu_index)` first, then write it.
+</Warning>
+
+### IO flags
+
+`read_index` accepts an optional `io_flags` bitmask that modifies loading behavior. Flags are defined in `faiss/index_io.h`:
+
+| Flag constant | Value | Effect |
+|---|---|---|
+| `IO_FLAG_READ_ONLY` | `2` | Open the file read-only. |
+| `IO_FLAG_ONDISK_SAME_DIR` | `4` | Strip directory from the on-disk filename; assume it is in the same directory as the index file. |
+| `IO_FLAG_SKIP_IVF_DATA` | `8` | Load only list sizes, not the actual codes. Combine with `IO_FLAG_MMAP` for on-disk access. |
+| `IO_FLAG_SKIP_PRECOMPUTE_TABLE` | `16` | Skip precomputing lookup tables after loading. Faster load, slightly slower first search. |
+| `IO_FLAG_PQ_SKIP_SDC_TABLE` | `32` | Skip the symmetric distance computation table for PQ indexes. **Note:** omitting the SDC table prevents inter-element distance computation, which means graph construction for `IndexHNSWPQ` will fail. |
+| `IO_FLAG_MMAP` | `IO_FLAG_SKIP_IVF_DATA \| 0x646f0000` | Memory-map the data (reads are served from disk). Useful for datasets larger than RAM. |
+| `IO_FLAG_SKIP_STORAGE` | `1` | Skip storage for graph-based indexes (HNSW). |
+
+```python
+# Load an IVF index without pulling codes into RAM
+index = faiss.read_index("large_index.faiss", faiss.IO_FLAG_MMAP)
+
+# Load read-only
+index = faiss.read_index("index.faiss", faiss.IO_FLAG_READ_ONLY)
+
+# Combine flags with bitwise OR
+index = faiss.read_index(
+    "index.faiss",
+    faiss.IO_FLAG_READ_ONLY | faiss.IO_FLAG_ONDISK_SAME_DIR
+)
+```
+
+---
+
+## Binary indexes
+
+For binary vector indexes (`IndexBinaryFlat`, `IndexBinaryIVF`, etc.), use the corresponding binary I/O functions:
+
+```python
+import faiss
+import numpy as np
+
+d = 256                          # dimension in bits
+nb = 10000
+xb = np.random.randint(0, 256, (nb, d // 8)).astype('uint8')
+
+index = faiss.IndexBinaryFlat(d)
+index.add(xb)
+
+# Save
+faiss.write_index_binary(index, "binary_index.faiss")
+
+# Load
+index2 = faiss.read_index_binary("binary_index.faiss")
+print(index2.ntotal)             # 10000
+```
+
+<Note>
+Binary and float32 index files are not interchangeable. Using `read_index` on a file written by `write_index_binary` will raise an error.
+</Note>
+
+---
+
+## On-disk indexes with merge_ondisk
+
+For datasets too large to fit in RAM, Faiss can store the inverted list data in a memory-mapped file on disk while keeping only the coarse quantizer and metadata in RAM. The `faiss.contrib.ondisk.merge_ondisk` helper handles the merge workflow.
+
+**Typical use case:** You have built and populated many per-shard IVF indexes. `merge_ondisk` combines their inverted lists into a single on-disk file and attaches it to a trained index.
+
+<Steps>
+  <Step title="Build and save shard indexes">
+    Each shard is a standard IVF index trained with the same quantizer.
+
+    ```python
+    import faiss
+    import numpy as np
+
+    d = 64
+    nlist = 100
+
+    # Shared trained quantizer
+    quantizer = faiss.IndexFlatL2(d)
+    trained_index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
+    train_data = np.random.random((10000, d)).astype('float32')
+    trained_index.train(train_data)
+
+    shard_fnames = []
+    for i in range(4):
+        shard = faiss.clone_index(trained_index)
+        shard_data = np.random.random((25000, d)).astype('float32')
+        shard.add(shard_data)
+        fname = f"shard_{i}.faiss"
+        faiss.write_index(shard, fname)
+        shard_fnames.append(fname)
+    ```
+  </Step>
+  <Step title="Merge shards into an on-disk index">
+    ```python
+    from faiss.contrib.ondisk import merge_ondisk
+
+    # Start with a trained but empty index
+    merged_index = faiss.clone_index(trained_index)
+    assert merged_index.ntotal == 0
+
+    # Merge the shard inverted lists into a single .ivfdata file
+    merge_ondisk(merged_index, shard_fnames, "merged.ivfdata")
+
+    # Save the index (the .ivfdata file is referenced separately)
+    faiss.write_index(merged_index, "merged_index.faiss")
+    print(merged_index.ntotal)  # 100000
+    ```
+  </Step>
+  <Step title="Load and search the on-disk index">
+    ```python
+    index = faiss.read_index(
+        "merged_index.faiss",
+        faiss.IO_FLAG_ONDISK_SAME_DIR
+    )
+
+    xq = np.random.random((100, d)).astype('float32')
+    D, I = index.search(xq, 4)
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+Do not modify the `.ivfdata` file while it is open via a memory-mapped index. Writes to an open mmap may corrupt the index or cause undefined behavior. To update the data, rebuild the shard and re-run `merge_ondisk`.
+</Warning>
+
+<Note>
+`IndexIVFPQR` is not supported by `merge_ondisk`. Use `IndexIVFFlat` or `IndexIVFPQ` for on-disk workflows.
+</Note>
+
+---
+
+## Serializing to bytes
+
+For network transfer or in-memory caching, you can serialize an index to a numpy `uint8` array without touching the filesystem.
+
+```python
+import faiss
+import numpy as np
+
+d = 64
+xb = np.random.random((10000, d)).astype('float32')
+
+index = faiss.IndexFlatL2(d)
+index.add(xb)
+
+# Serialize to a numpy uint8 array
+data = faiss.serialize_index(index)
+print(type(data), data.dtype, data.shape)
+# <class 'numpy.ndarray'> uint8 (...)
+
+# Deserialize from the array
+index2 = faiss.deserialize_index(data)
+print(index2.ntotal)  # 10000
+
+# Verify search results match
+D1, I1 = index.search(xb[:5], 4)
+D2, I2 = index2.search(xb[:5], 4)
+assert (I1 == I2).all()
+```
+
+`faiss.serialize_index` returns the same bytes that `write_index` would write to a file. You can send this array over a socket, store it in Redis, or pass it between processes.
+
+```python
+import pickle
+
+# Round-trip through pickle
+payload = pickle.dumps(data)
+data2 = pickle.loads(payload)
+index3 = faiss.deserialize_index(data2)
+```
+
+---
+
+## Tips and compatibility
+
+**Backward compatibility:**
+- Faiss index files are generally forward-compatible (older files can be read by newer Faiss versions).
+- They are not guaranteed backward-compatible (files written by newer versions may not load in older Faiss builds).
+- Include the Faiss version in your index filenames or metadata for long-term archival.
+
+**Deserialization safety limits:**
+- `faiss.set_deserialization_loop_limit(n)` rejects index files where structural loop parameters (e.g., `nlist`) exceed `n`. Set this before loading untrusted files.
+- `faiss.set_deserialization_vector_byte_limit(n)` caps the maximum bytes a single vector allocation may request. Default is 1 TiB.
+
+**IVF index ownership:**
+- When `merge_ondisk` replaces inverted lists with `OnDiskInvertedLists`, the index takes ownership of the on-disk object. Deleting the index closes the file handle.
+- If you need multiple processes to share the same `.ivfdata` file, open each index with `IO_FLAG_READ_ONLY`.

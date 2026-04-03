@@ -1,0 +1,105 @@
+---
+title: "Introduction"
+description: "Faiss is a library for efficient similarity search and clustering of dense vectors, built by Meta AI Research."
+---
+
+## What is Faiss?
+
+Faiss (Facebook AI Similarity Search) is a library for efficient similarity search and clustering of dense vectors. It contains algorithms that search in sets of vectors of any size, up to ones that possibly do not fit in RAM. It also contains supporting code for evaluation and parameter tuning.
+
+At its core, Faiss is built around the concept of an **index** — a data structure that stores a collection of vectors and exposes a search interface. Given a query vector, the index returns the nearest neighbors ranked by L2 (Euclidean) distance or inner product (dot product). Cosine similarity is also supported as a dot product on normalized vectors.
+
+### What is similarity search?
+
+Similarity search is the problem of finding, from a large collection of vectors, the ones most similar to a given query vector. It is a foundational operation in many AI systems:
+
+- **Retrieval-augmented generation (RAG)**: finding relevant document chunks to provide as context to a language model
+- **Recommendation systems**: matching user embeddings against item embeddings to surface relevant content
+- **Image and video search**: retrieving visually similar media using embedding models
+- **Duplicate detection**: identifying near-duplicate records in large datasets
+- **Semantic search**: searching text by meaning rather than keyword overlap
+
+Modern neural networks encode inputs (text, images, audio) as high-dimensional float vectors. Once your data is in vector form, Faiss handles the hard part: building an index over millions or billions of vectors and querying it in milliseconds.
+
+## Key capabilities
+
+### Exact and approximate search
+
+| Index | Description |
+|---|---|
+| `IndexFlatL2` | Exact brute-force L2 search. No training required. |
+| `IndexFlatIP` | Exact brute-force inner product search. |
+| `IndexIVFFlat` | Approximate search using inverted file (IVF) partitioning. Requires training. |
+| `IndexIVFPQ` | Approximate search with Product Quantization (PQ) compression. Scales to billions of vectors. |
+| `IndexHNSW` | Graph-based approximate search (Hierarchical Navigable Small World). |
+| `IndexPQ` | Pure Product Quantization index for compact storage. |
+
+Every index type represents a different trade-off across search speed, search quality, memory per vector, training time, and add time. Binary indexes are also available for Hamming-distance search.
+
+### GPU acceleration
+
+The GPU implementation provides what is likely the fastest exact and approximate nearest neighbor search for high-dimensional vectors. GPU indexes are drop-in replacements for their CPU counterparts — for example, `IndexFlatL2` can be moved to the GPU with a single call to `faiss.index_cpu_to_gpu()`. Both single-GPU and multi-GPU usage are supported.
+
+Input can come from either CPU or GPU memory; Faiss handles transfers automatically.
+
+### Clustering
+
+Faiss includes an efficient implementation of Lloyd's k-means algorithm. On GPU, it provides what is likely the fastest k-means available for high-dimensional dense vectors.
+
+### The `index_factory`
+
+The `index_factory` function constructs composite indexes from a string descriptor, making it easy to specify complex pipelines:
+
+```python
+index = faiss.index_factory(64, "IVF100,Flat")
+index = faiss.index_factory(64, "IVF100,PQ8")
+```
+
+## Architecture overview
+
+```
+┌─────────────────────────────────────────┐
+│              Python / NumPy             │  ← High-level API via SWIG bindings
+├─────────────────────────────────────────┤
+│              C++ core library           │  ← All index algorithms implemented here
+│  (IndexFlat, IndexIVF, IndexHNSW, ...)  │
+├─────────────────────────────────────────┤
+│         BLAS / MKL / OpenBLAS           │  ← Dense linear algebra (required)
+├──────────────────────┬──────────────────┤
+│      CUDA (GPU)      │   AMD ROCm (GPU) │  ← Optional GPU backends
+│  NVIDIA cuVS (GPU)   │                  │
+└──────────────────────┴──────────────────┘
+```
+
+**C++ core**: All vector indexing and search algorithms are implemented in C++. The library requires only a BLAS implementation as a dependency. It compiles with CMake and supports AVX2, AVX-512, and ARM SVE SIMD optimizations.
+
+**Python bindings**: The Python interface is generated via SWIG and exposes the full C++ API. Vectors are passed as NumPy `float32` arrays. The Python package is distributed via conda.
+
+**GPU support**: CUDA-based GPU indexes are included for NVIDIA hardware. AMD ROCm support is available for AMD GPUs. NVIDIA cuVS integration provides state-of-the-art IVF-Flat, IVF-PQ, and CAGRA implementations.
+
+## When to use Faiss
+
+Faiss is the right tool when you need to:
+
+- Search for nearest neighbors in a dataset of **millions to billions** of float32 vectors
+- Control the **speed/accuracy trade-off** precisely (exact search vs. approximate search)
+- Run similarity search on **GPU** for maximum throughput
+- Work in **C++ or Python** without depending on a separate server process
+- Perform **k-means clustering** at scale on dense vectors
+
+Faiss is a library, not a database. It does not handle persistence, replication, filtering by metadata, or distributed deployments on its own. If you need those features, consider building on top of Faiss or using a vector database that uses Faiss internally.
+
+## Get started
+
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Install Faiss and run your first similarity search in minutes.
+  </Card>
+  <Card title="Indexes overview" icon="database" href="/concepts/indexes-overview">
+    Learn how Faiss index types work and how to choose the right one.
+  </Card>
+</CardGroup>
+
+<Note>
+  Faiss is MIT-licensed. It was created at Meta's Fundamental AI Research (FAIR) group and is developed primarily there. Copyright &copy; Meta Platforms, Inc.
+</Note>

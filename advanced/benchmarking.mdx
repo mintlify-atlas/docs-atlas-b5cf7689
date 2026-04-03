@@ -1,0 +1,298 @@
+---
+title: "Benchmarking"
+description: "How to measure Faiss search quality and throughput, use standard ANN benchmark datasets, and run the Faiss benchmark suite."
+---
+
+Meaningful benchmarking requires both a **quality metric** (how accurate are the results?) and a **throughput metric** (how fast are they?). This page covers the standard evaluation metrics used in the Faiss codebase, the datasets used to measure them, and how to profile and reproduce benchmark results.
+
+---
+
+## Standard evaluation metrics
+
+### Recall@k
+
+**Recall@k** (written R@k) is the fraction of true nearest neighbors that appear among the top-k approximate results, averaged over all queries.
+
+The most common thresholds in the literature are:
+
+| Metric | Meaning |
+|--------|---------|
+| R@1 | True nearest neighbor is the top-1 result |
+| R@10 | True nearest neighbor is in the top-10 results |
+| R@100 | True nearest neighbor is in the top-100 results |
+
+For multi-neighbor recall, R@k can also measure what fraction of the *k* true nearest neighbors appear in the *k* approximate results—this is the intersection-based variant.
+
+### Computing recall with `faiss.eval_intersection`
+
+`faiss.eval_intersection` counts the total number of index positions that match between two result tables:
+
+```python
+import faiss
+import numpy as np
+
+# D_approx, I_approx: results from index.search(xq, k)  — shape (nq, k)
+# gt: ground-truth nearest-neighbor indices              — shape (nq, k)
+D_approx, I_approx = index.search(xq, k)
+
+n_correct = faiss.eval_intersection(I_approx, gt)
+recall_at_k = n_correct / (xq.shape[0] * k)
+print(f"R@{k} = {recall_at_k:.4f}")
+```
+
+### Computing recall@1 directly
+
+For R@1 the comparison is a simple array equality check:
+
+```python
+# I: shape (nq, k), gt: shape (nq, >=1)
+recall_at_1 = (I_approx[:, :1] == gt[:, :1]).sum() / float(xq.shape[0])
+print(f"R@1 = {recall_at_1:.4f}")
+```
+
+This pattern appears throughout the benchmark scripts, e.g. `benchs/bench_hnsw.py`:
+
+```python
+def evaluate(index):
+    t0 = time.time()
+    D, I = index.search(xq, k)
+    t1 = time.time()
+
+    missing_rate = (I == -1).sum() / float(k * nq)
+    recall_at_1 = (I == gt[:, :1]).sum() / float(nq)
+    print("\t %7.3f ms per query, R@1 %.4f, missing rate %.4f" % (
+        (t1 - t0) * 1000.0 / nq, recall_at_1, missing_rate))
+```
+
+### Intersection-based recall with `contrib/evaluation.py`
+
+For set-level recall (how much of the ground-truth top-k set was recovered), use `knn_intersection_measure`:
+
+```python
+from faiss.contrib.evaluation import knn_intersection_measure
+
+# I1, I2: result tables of identical shape (nq, k)
+# Returns average fraction of matching entries across all queries
+score = knn_intersection_measure(I_approx, gt)
+print(f"intersection recall = {score:.4f}")
+```
+
+---
+
+## Benchmark datasets
+
+### Standard ANN benchmark datasets
+
+The Faiss benchmark suite is designed around three publicly available datasets that span a range of scales:
+
+| Dataset | Vectors | Dimension | Source |
+|---------|---------|-----------|--------|
+| SIFT1M | 1,000,000 | 128 | INRIA / corpus-texmex.irisa.fr |
+| GIST1M | 1,000,000 | 960 | INRIA / corpus-texmex.irisa.fr |
+| Deep1B | 1,000,000,000 | 96 | Yandex |
+
+### Getting SIFT1M
+
+Download the `ANN_SIFT1M` archive from `http://corpus-texmex.irisa.fr/` and extract it into a `sift1M/` subdirectory. The archive contains four files in the `.fvecs`/`.ivecs` binary format:
+
+```bash
+# After extracting:
+ls sift1M/
+# sift_base.fvecs      (1M base vectors, 128-d float32)
+# sift_learn.fvecs     (100k training vectors)
+# sift_query.fvecs     (10k query vectors)
+# sift_groundtruth.ivecs  (100 exact NNs per query)
+```
+
+Reading these files in Python (pattern from `demos/demo_auto_tune.py`):
+
+```python
+import numpy as np
+
+def ivecs_read(fname):
+    a = np.fromfile(fname, dtype="int32")
+    d = a[0]
+    return a.reshape(-1, d + 1)[:, 1:].copy()
+
+def fvecs_read(fname):
+    return ivecs_read(fname).view('float32')
+
+xb = fvecs_read("sift1M/sift_base.fvecs")      # (1_000_000, 128)
+xq = fvecs_read("sift1M/sift_query.fvecs")     # (10_000, 128)
+xt = fvecs_read("sift1M/sift_learn.fvecs")     # (100_000, 128)
+gt = ivecs_read("sift1M/sift_groundtruth.ivecs").astype('int64')  # (10_000, 100)
+```
+
+### Using the datasets helper
+
+`faiss.contrib.datasets` provides a loader that handles the file layout automatically:
+
+```python
+from faiss.contrib.datasets import DatasetSIFT1M
+
+ds  = DatasetSIFT1M()
+xb  = ds.get_database()
+xq  = ds.get_queries()
+xt  = ds.get_train()
+gt  = ds.get_groundtruth()
+```
+
+### Getting Deep1B
+
+Ground-truth and query files are available from `https://yadi.sk/d/11eDCm7Dsn9GA`. Database and training vectors can be downloaded using the script at `https://github.com/arbabenko/GNOIMI/blob/master/downloadDeep1B.py`.
+
+### The `benchs/` directory
+
+All benchmark scripts are self-contained and live in `benchs/`. They reproduce the results from the original Faiss papers and serve as working examples of correct measurement methodology:
+
+- **`benchs/bench_polysemous_sift1m.py`** — reproduces Figure 3 from the Polysemous Codes paper (ECCV 2016)
+- **`benchs/bench_polysemous_1bn.py`** — billion-scale experiments on SIFT1B and Deep1B
+- **`benchs/bench_gpu_sift1m.py`** — GPU exact and approximate search on SIFT1M
+- **`benchs/bench_gpu_1bn.py`** — multi-GPU search on 1B-vector datasets
+- **`benchs/bench_hnsw.py`** — HNSW variants including IVF with HNSW quantizer and NSG
+- **`benchs/bench_index_flat.py`** — `IndexFlatL2` throughput at varying dimensions and batch sizes
+- **`benchs/bench_ivf_fastscan.py`** — `IVF{nlist},PQ{M}x4fs` vs other index types on SIFT1M
+- **`benchs/bench_scalar_quantizer.py`** — IVF+SQ variants on SIFT1M
+
+---
+
+## Profiling search performance
+
+### Measuring QPS with the Python `time` module
+
+The fundamental measurement loop used throughout the benchmarks:
+
+```python
+import time
+import faiss
+
+# Single-threaded search (set threads=1 for reproducible timings)
+faiss.omp_set_num_threads(1)
+
+nq = xq.shape[0]
+t0 = time.time()
+D, I = index.search(xq, k)
+t1 = time.time()
+
+ms_per_query = (t1 - t0) * 1000.0 / nq
+qps = nq / (t1 - t0)
+print(f"{ms_per_query:.3f} ms/query  ({qps:.0f} QPS)")
+```
+
+### Tracing the recall/speed curve by varying `nprobe`
+
+For IVF indexes, sweeping `nprobe` from 1 to `nlist` traces the full accuracy/speed trade-off curve. Output from `benchs/bench_gpu_sift1m.py` illustrates the typical shape:
+
+```
+nprobe=   1  0.043 s  recalls= 0.3909 0.4312 0.4312
+nprobe=   2  0.040 s  recalls= 0.5041 0.5636 0.5636
+nprobe=   4  0.048 s  recalls= 0.6048 0.6897 0.6897
+nprobe=   8  0.064 s  recalls= 0.6879 0.8028 0.8028
+nprobe=  16  0.088 s  recalls= 0.7534 0.8940 0.8940
+nprobe=  32  0.134 s  recalls= 0.7957 0.9549 0.9550
+nprobe=  64  0.224 s  recalls= 0.8125 0.9833 0.9834
+nprobe= 128  0.395 s  recalls= 0.8205 0.9953 0.9954
+nprobe= 256  0.717 s  recalls= 0.8227 0.9993 0.9994
+```
+
+Python code to generate the same sweep:
+
+```python
+import time
+import faiss
+
+for nprobe in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
+    faiss.ParameterSpace().set_index_parameters(index, f"nprobe={nprobe}")
+
+    t0 = time.time()
+    D, I = index.search(xq, k)
+    t1 = time.time()
+
+    r1  = (I[:, :1]  == gt[:, :1]).sum()  / float(nq)
+    r10 = (I[:, :10] == gt[:, :1]).any(axis=1).sum() / float(nq)
+    print(f"nprobe={nprobe:4d}  {(t1-t0):.3f}s  R@1={r1:.4f}  R@10={r10:.4f}")
+```
+
+### Using `RepeatTimer` for stable measurements
+
+For sub-millisecond operations, a single timed run can be noisy. `contrib/evaluation.py` provides `RepeatTimer`:
+
+```python
+from faiss.contrib.evaluation import RepeatTimer
+
+timer = RepeatTimer(warmup=1, nt=1, runs=6)
+for _ in timer:
+    D, I = index.search(xq, k)
+
+print(f"time={timer.ms():.1f} ± {timer.ms_std():.1f} ms")
+```
+
+---
+
+## Running the benchmark suite
+
+<Steps>
+  <Step title="Install Faiss and prepare data">
+    ```bash
+    # Conda install
+    conda install -c pytorch faiss-cpu
+
+    # Download and extract SIFT1M into benchs/sift1M/
+    cd benchs/
+    wget http://corpus-texmex.irisa.fr/sift.tar.gz
+    tar -xzf sift.tar.gz
+    mv sift sift1M
+    ```
+  </Step>
+
+  <Step title="Run a single benchmark script">
+    ```bash
+    cd benchs/
+    python bench_polysemous_sift1m.py
+    ```
+
+    Expected output shape:
+
+    ```
+    PQ baseline        7.517 ms per query, R@1 0.4474
+    Polysemous 64      9.875 ms per query, R@1 0.4474
+    Polysemous 62      8.358 ms per query, R@1 0.4474
+    Polysemous 58      5.531 ms per query, R@1 0.4474
+    Polysemous 54      3.420 ms per query, R@1 0.4478
+    ...
+    ```
+  </Step>
+
+  <Step title="Run HNSW benchmarks">
+    ```bash
+    # k=1 nearest neighbor, test all index variants
+    python bench_hnsw.py 1
+    # or select specific variants
+    python bench_hnsw.py 1 hnsw ivf
+    ```
+  </Step>
+
+  <Step title="Run the GPU benchmark">
+    ```bash
+    python bench_gpu_sift1m.py
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+Always run several **warm-up queries** before starting the timed section. The first batch of searches can be significantly slower due to cold CPU caches, BLAS library initialization, and OS page-fault overhead on memory-mapped indexes.
+
+```python
+# warm-up: discard timing
+_ = index.search(xq[:10], k)
+
+# now measure
+t0 = time.time()
+D, I = index.search(xq, k)
+t1 = time.time()
+```
+</Tip>
+
+<Note>
+Benchmark numbers depend heavily on hardware. The same script can show 2–5× timing differences between CPU generations due to SIMD instruction set support (SSE4, AVX2, AVX-512). Faiss automatically selects the best available SIMD path at runtime, but reported timings from the papers were obtained on specific server-class hardware (Intel Xeon E5-2698 v4 and similar). Always re-run benchmarks on your own hardware before drawing conclusions.
+</Note>

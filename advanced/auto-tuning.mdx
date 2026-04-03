@@ -1,0 +1,283 @@
+---
+title: "Auto-tuning index parameters"
+description: "Use Faiss AutoTune to automatically find optimal search parameters—nprobe, efSearch, and more—that hit a target recall for a given index type."
+---
+
+Approximate nearest-neighbor search involves a fundamental trade-off: relaxing search thoroughness raises queries-per-second but lowers recall. Faiss provides an **auto-tuning** subsystem that systematically explores the space of runtime search parameters and identifies Pareto-optimal operating points on the recall/speed curve, so you can choose the point that best fits your latency or quality budget.
+
+## AutoTuneCriterion
+
+An `AutoTuneCriterion` defines what *good* search means: it receives the approximate search results and compares them against ground truth, returning a performance score in `[0, 1]` where higher is better.
+
+```cpp
+struct AutoTuneCriterion {
+    idx_t nq;      // nb of queries this criterion is evaluated on
+    idx_t nnn;     // nb of NNs that the query should request
+    idx_t gt_nnn;  // nb of GT NNs required to evaluate criterion
+
+    std::vector<float> gt_D; // Ground-truth distances (size nq * gt_nnn)
+    std::vector<idx_t> gt_I; // Ground-truth indexes  (size nq * gt_nnn)
+    ...
+};
+```
+
+| Field | Description |
+|-------|-------------|
+| `nq` | Number of query vectors used for evaluation |
+| `nnn` | Number of nearest neighbors the index is asked to return |
+| `gt_nnn` | Number of ground-truth neighbors stored (must be `>= nnn`) |
+| `gt_D` | Flat array of ground-truth distances, shape `nq × gt_nnn` |
+| `gt_I` | Flat array of ground-truth indices, shape `nq × gt_nnn` |
+
+### Setting ground truth with `set_groundtruth()`
+
+Before any evaluation can happen you must supply exact-search results:
+
+```cpp
+void AutoTuneCriterion::set_groundtruth(
+    int        gt_nnn,    // number of GT neighbors per query
+    const float*  gt_D_in,  // may be nullptr when distances are unused
+    const idx_t*  gt_I_in   // required
+);
+```
+
+In Python the same method is called with NumPy arrays:
+
+```python
+import faiss
+import numpy as np
+
+# gt is a (nq, k) int64 array of exact nearest-neighbor indices
+crit = faiss.OneRecallAtRCriterion(xq.shape[0], 1)
+crit.set_groundtruth(None, gt)   # gt_D may be None
+crit.nnn = gt.shape[1]
+```
+
+### OneRecallAtRCriterion
+
+`OneRecallAtRCriterion(nq, R)` measures **1-recall@R**: the fraction of queries for which the true nearest neighbor (index 0 in the ground-truth list) appears anywhere within the top-R approximate results.
+
+```python
+crit = faiss.OneRecallAtRCriterion(xq.shape[0], 1)
+# Returns a value in [0, 1]; 1.0 means the true NN was found for every query
+```
+
+Internally, for each query `q` the criterion checks whether `gt_I[q * gt_nnn]` appears in the first `R` rows of the approximate result:
+
+```cpp
+OneRecallAtRCriterion::evaluate(...):
+    for q in range(nq):
+        gt_nn = gt_I[q * gt_nnn]         // single ground-truth neighbor
+        if gt_nn in I[q * nnn : q * nnn + R]:
+            n_ok++
+    return n_ok / double(nq)
+```
+
+### IntersectionCriterion
+
+`IntersectionCriterion(nq, R)` measures the **average intersection** between the top-R approximate results and the top-R ground-truth results, normalized to `[0, 1]`:
+
+```python
+crit = faiss.IntersectionCriterion(xq.shape[0], 10)
+crit.set_groundtruth(10, gt_D, gt_I)
+# score = |approx_top_R ∩ gt_top_R| / (nq * R)
+```
+
+This is a softer metric than `OneRecallAtRCriterion`: partial credit is given when some—but not all—of the true top-R neighbors are found.
+
+---
+
+## ParameterSpace
+
+`ParameterSpace` uses a priori knowledge of Faiss index types to enumerate all tunable runtime parameters and their candidate values.
+
+```cpp
+struct ParameterSpace {
+    std::vector<ParameterRange> parameter_ranges; // tunable parameters
+    int    verbose;              // verbosity during exploration
+    int    n_experiments;        // 0 = try all combinations
+    size_t batchsize;            // max queries per experiment batch
+    bool   thread_over_batches;  // benchmark independent single-searches
+    double min_test_duration;    // repeat until at least this duration (s)
+    ...
+};
+```
+
+### What parameters can be tuned
+
+`ParameterSpace::initialize(index)` inspects the index and registers the relevant parameters automatically:
+
+| Index type | Parameters exposed |
+|------------|--------------------|
+| `IndexIVF*` | `nprobe` |
+| `IndexHNSW` | `efSearch` |
+| `IndexIVFPQ` (with Hamming filter) | `nprobe`, `ht` (Hamming threshold) |
+| `IndexIVF` with `max_codes` | `nprobe`, `max_codes` |
+| `IndexRefine` | base + `k_factor` |
+
+### Enumerating parameter combinations
+
+`n_combinations()` returns the product of all value-list lengths. You can iterate over them with `combination_name(cno)` to get a human-readable string like `"nprobe=16,efSearch=64"`:
+
+```python
+params = faiss.ParameterSpace()
+params.initialize(index)
+
+print("total combinations:", params.n_combinations())
+
+for cno in range(params.n_combinations()):
+    print(cno, params.combination_name(cno))
+```
+
+### Running exploration with `explore()`
+
+`explore()` evaluates every (or a sampled subset of) parameter combinations on the query set, measures wall-clock time, and collects the Pareto-optimal operating points:
+
+```python
+# opi is a faiss.OperatingPoints object
+opi = params.explore(index, xq, crit)
+opi.display()          # human-readable table
+```
+
+The C++ signature:
+
+```cpp
+void ParameterSpace::explore(
+    Index*                  index,
+    size_t                  nq,
+    const float*            xq,
+    const AutoTuneCriterion& crit,
+    OperatingPoints*        ops
+) const;
+```
+
+---
+
+## Practical auto-tuning workflow
+
+The full workflow is demonstrated in `demos/demo_auto_tune.py`. Below is the essential pattern:
+
+<Steps>
+  <Step title="Load data and ground truth">
+    ```python
+    import faiss
+    import numpy as np
+
+    # Load vectors and ground truth (demo uses SIFT1M .fvecs/.ivecs format)
+    xt = fvecs_read("sift1M/sift_learn.fvecs")
+    xb = fvecs_read("sift1M/sift_base.fvecs")
+    xq = fvecs_read("sift1M/sift_query.fvecs")
+
+    gt = ivecs_read("sift1M/sift_groundtruth.ivecs")
+    gt = gt.astype('int64')
+    k  = gt.shape[1]
+    d  = xt.shape[1]
+    ```
+  </Step>
+
+  <Step title="Set up the criterion">
+    ```python
+    # 1-recall@1: the true nearest neighbor must appear in the top-1 result
+    crit = faiss.OneRecallAtRCriterion(xq.shape[0], 1)
+    crit.set_groundtruth(None, gt)
+    crit.nnn = k
+    ```
+  </Step>
+
+  <Step title="Build and train the index">
+    ```python
+    index_key = "IVF4096,Flat"
+    index = faiss.index_factory(d, index_key)
+    index.train(xt)
+    index.add(xb)
+    ```
+  </Step>
+
+  <Step title="Initialize ParameterSpace and explore">
+    ```python
+    params = faiss.ParameterSpace()
+    params.initialize(index)
+
+    # opi contains the Pareto-optimal operating points for this index
+    opi = params.explore(index, xq, crit)
+    opi.display()
+    ```
+  </Step>
+
+  <Step title="Merge results across index types">
+    ```python
+    # Accumulate best points across multiple index configurations
+    op = faiss.OperatingPoints()
+
+    for index_key in ["IMI2x10,Flat", "IVF4096,Flat", "IVF16384,Flat"]:
+        index = faiss.index_factory(d, index_key)
+        index.train(xt)
+        index.add(xb)
+
+        params = faiss.ParameterSpace()
+        params.initialize(index)
+        opi = params.explore(index, xq, crit)
+
+        op.merge_with(opi, index_key + " ")
+
+    op.display()
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Interpreting results
+
+### Reading the operating points table
+
+`OperatingPoints::display()` prints the Pareto-optimal frontier, sorted by performance:
+
+```
+Parameters                         perf      t (ms/query)
+IVF4096,Flat nprobe=1             0.3909     0.043
+IVF4096,Flat nprobe=4             0.6048     0.048
+IVF4096,Flat nprobe=16            0.7534     0.088
+IVF4096,Flat nprobe=64            0.8125     0.224
+IVF4096,Flat nprobe=256           0.8227     0.717
+```
+
+Each row is a **Pareto-optimal point**: no other configuration simultaneously achieves higher recall and lower latency.
+
+### Selecting an operating point
+
+Use `OperatingPoints::t_for_perf(perf)` to look up the minimum time required to reach a given recall target:
+
+```python
+# How long does it take to reach 0.90 recall?
+t = opi.t_for_perf(0.90)
+print(f"time for recall=0.90: {t:.3f} ms/query")
+```
+
+To enumerate all optimal points programmatically:
+
+```python
+for i in range(opi.optimal_pts.size()):
+    pt = opi.optimal_pts.at(i)
+    print(f"key={pt.key}  recall={pt.perf:.4f}  t={pt.t:.3f} ms")
+```
+
+### Visualizing the curve
+
+The demo script plots the recall/speed curve with matplotlib:
+
+```python
+ops = opi.optimal_pts
+n = ops.size() * 2 - 1
+pyplot.plot(
+    [ops.at(i // 2).perf       for i in range(n)],
+    [ops.at((i + 1) // 2).t / nq * 1000 for i in range(n)],
+)
+pyplot.xlabel("1-recall at 1")
+pyplot.ylabel("search time (ms/query)")
+pyplot.gca().set_yscale('log')
+```
+
+<Note>
+Auto-tuning results are only valid for the query distribution used during exploration. Always run on a **representative sample** of real queries—synthetic or out-of-distribution queries can produce operating points that do not generalize to production traffic.
+</Note>

@@ -1,0 +1,557 @@
+---
+title: "GPU indexes"
+description: "CUDA-accelerated indexes for maximum throughput"
+---
+
+GPU indexes are CUDA-accelerated implementations of their CPU counterparts. They share the same `add()`, `train()`, and `search()` interface as CPU indexes but execute on GPU hardware, delivering orders-of-magnitude higher throughput for large batch queries.
+
+All GPU indexes require a `GpuResourcesProvider` (typically `StandardGpuResources`) to manage device memory and CUDA streams.
+
+---
+
+## StandardGpuResources
+
+The standard resource manager for GPU indexes. It allocates a temporary scratch-memory pool on the GPU and manages CUDA streams and cuBLAS handles.
+
+```python
+import faiss
+
+res = faiss.StandardGpuResources()
+
+# Optionally limit temporary memory (default: 18% of GPU memory)
+res.setTempMemory(500 * 1024 * 1024)  # 500 MB
+```
+
+```cpp
+#include <faiss/gpu/StandardGpuResources.h>
+
+faiss::gpu::StandardGpuResources res;
+res.setTempMemory(500 * 1024 * 1024);
+```
+
+<Note>
+  One `StandardGpuResources` instance per GPU is the recommended pattern. It can be shared across multiple indexes on the same device.
+</Note>
+
+---
+
+## Moving indexes between CPU and GPU
+
+Faiss provides helper functions to convert CPU indexes to GPU and back. This is the most common way to create GPU indexes — build on CPU, then transfer.
+
+### Single GPU
+
+```python
+import faiss
+import numpy as np
+
+d = 64
+nb = 100000
+nq = 10000
+
+np.random.seed(1234)
+xb = np.random.random((nb, d)).astype('float32')
+xq = np.random.random((nq, d)).astype('float32')
+
+res = faiss.StandardGpuResources()
+
+# Build a CPU index
+cpu_index = faiss.IndexFlatL2(d)
+
+# Move to GPU 0
+gpu_index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
+
+gpu_index.add(xb)
+D, I = gpu_index.search(xq, 4)
+print(I[:5])
+```
+
+### All GPUs (data-parallel replicas)
+
+```python
+import faiss
+import numpy as np
+
+d = 64
+xb = np.random.random((100000, d)).astype('float32')
+xq = np.random.random((10000, d)).astype('float32')
+
+cpu_index = faiss.IndexFlatL2(d)
+
+# Replicate across all available GPUs
+gpu_index = faiss.index_cpu_to_all_gpus(cpu_index)
+
+gpu_index.add(xb)
+D, I = gpu_index.search(xq, 4)
+print(faiss.get_num_gpus(), "GPUs used")
+```
+
+### Moving back to CPU
+
+```python
+cpu_index_back = faiss.index_gpu_to_cpu(gpu_index)
+```
+
+---
+
+## GpuIndexConfig
+
+Base configuration struct for all GPU indexes:
+
+```cpp
+struct GpuIndexConfig {
+    int device = 0;                      // GPU device index
+    MemorySpace memorySpace = Device;    // Device or Unified memory
+    bool use_cuvs = false;              // Enable cuVS backend (if compiled in)
+};
+```
+
+---
+
+## GpuIndexFlatL2 / GpuIndexFlatIP
+
+GPU-accelerated exact search indexes. Drop-in replacements for `IndexFlatL2` and `IndexFlatIP`.
+
+```cpp
+// Construct from scratch
+GpuIndexFlatL2(GpuResourcesProvider* provider, int dims,
+               GpuIndexFlatConfig config = GpuIndexFlatConfig());
+
+GpuIndexFlatIP(GpuResourcesProvider* provider, int dims,
+               GpuIndexFlatConfig config = GpuIndexFlatConfig());
+
+// Construct by copying from an existing CPU index
+GpuIndexFlatL2(GpuResourcesProvider* provider, faiss::IndexFlatL2* index,
+               GpuIndexFlatConfig config = GpuIndexFlatConfig());
+```
+
+**`GpuIndexFlatConfig`** fields:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `useFloat16` | `bool` | `false` | Store vectors as float16 to halve GPU memory usage. Reduces precision slightly. |
+| `device` | `int` | `0` | GPU device index. |
+
+**When to use:** Exact search on datasets that fit in GPU memory. GPU throughput advantages are largest when searching many queries simultaneously (batch size ≥ 256).
+
+<Tabs>
+  <Tab title="Python (via cpu_to_gpu)">
+    ```python
+    import faiss
+    import numpy as np
+
+    d = 128
+    nb = 500000
+
+    res = faiss.StandardGpuResources()
+    cpu_index = faiss.IndexFlatL2(d)
+
+    gpu_index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
+    gpu_index.add(np.random.random((nb, d)).astype('float32'))
+
+    D, I = gpu_index.search(np.random.random((1000, d)).astype('float32'), 10)
+    ```
+  </Tab>
+  <Tab title="Python (direct construction)">
+    ```python
+    import faiss
+
+    d = 128
+    res = faiss.StandardGpuResources()
+
+    cfg = faiss.GpuIndexFlatConfig()
+    cfg.device = 0
+    cfg.useFloat16 = False
+
+    gpu_index = faiss.GpuIndexFlatL2(res, d, cfg)
+    gpu_index.add(xb)
+    D, I = gpu_index.search(xq, 10)
+    ```
+  </Tab>
+  <Tab title="C++">
+    ```cpp
+    #include <faiss/gpu/GpuIndexFlat.h>
+    #include <faiss/gpu/StandardGpuResources.h>
+
+    faiss::gpu::StandardGpuResources res;
+
+    faiss::gpu::GpuIndexFlatConfig cfg;
+    cfg.device = 0;
+    cfg.useFloat16 = false;
+
+    faiss::gpu::GpuIndexFlatL2 index(&res, d, cfg);
+    index.add(nb, xb);
+    index.search(nq, xq, k, D, I);
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## GpuIndexIVFFlat
+
+GPU-accelerated IVF index with flat (uncompressed) storage. Equivalent to `IndexIVFFlat` on the GPU.
+
+```cpp
+// Auto-creates a flat coarse quantizer
+GpuIndexIVFFlat(
+    GpuResourcesProvider* provider,
+    int dims,
+    idx_t nlist,
+    faiss::MetricType metric = faiss::METRIC_L2,
+    GpuIndexIVFFlatConfig config = GpuIndexIVFFlatConfig());
+
+// With a provided coarse quantizer (CPU or GPU)
+GpuIndexIVFFlat(
+    GpuResourcesProvider* provider,
+    Index* coarseQuantizer,
+    int dims,
+    idx_t nlist,
+    faiss::MetricType metric = faiss::METRIC_L2,
+    GpuIndexIVFFlatConfig config = GpuIndexIVFFlatConfig());
+```
+
+**`GpuIndexIVFFlatConfig`** fields (extends `GpuIndexIVFConfig`):
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `interleavedLayout` | `bool` | `true` | Use interleaved memory layout for inverted lists (generally faster). |
+| `indicesOptions` | `IndicesOptions` | `INDICES_64_BIT` | How vector indices are stored on the GPU. |
+| `flatConfig` | `GpuIndexFlatConfig` | — | Config for the internal coarse quantizer. |
+
+**When to use:** IVF approximate search on the GPU when data fits in GPU VRAM and you need configurable recall via `nprobe`.
+
+<Tabs>
+  <Tab title="Python (via cpu_to_gpu)">
+    ```python
+    import faiss
+    import numpy as np
+
+    d = 64
+    nb = 100000
+    nlist = 100
+
+    res = faiss.StandardGpuResources()
+
+    quantizer = faiss.IndexFlatL2(d)
+    cpu_ivf = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
+
+    gpu_ivf = faiss.index_cpu_to_gpu(res, 0, cpu_ivf)
+    gpu_ivf.train(np.random.random((nb, d)).astype('float32'))
+    gpu_ivf.add(np.random.random((nb, d)).astype('float32'))
+
+    gpu_ivf.nprobe = 10
+    D, I = gpu_ivf.search(np.random.random((1000, d)).astype('float32'), 4)
+    ```
+  </Tab>
+  <Tab title="C++">
+    ```cpp
+    #include <faiss/gpu/GpuIndexIVFFlat.h>
+    #include <faiss/gpu/StandardGpuResources.h>
+
+    faiss::gpu::StandardGpuResources res;
+    faiss::gpu::GpuIndexIVFFlatConfig cfg;
+
+    faiss::gpu::GpuIndexIVFFlat index(&res, d, nlist,
+                                       faiss::METRIC_L2, cfg);
+    index.train(nb, xb);
+    index.add(nb, xb);
+    index.nprobe = 10;
+    index.search(nq, xq, k, D, I);
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## GpuIndexIVFPQ
+
+GPU-accelerated IVFPQ index. Encodes residual vectors with product quantization, reducing VRAM requirements at the cost of recall.
+
+```cpp
+// Auto-creates a flat coarse quantizer
+GpuIndexIVFPQ(
+    GpuResourcesProvider* provider,
+    int dims,
+    idx_t nlist,
+    idx_t subQuantizers,
+    idx_t bitsPerCode,
+    faiss::MetricType metric = faiss::METRIC_L2,
+    GpuIndexIVFPQConfig config = GpuIndexIVFPQConfig());
+
+// With a provided coarse quantizer
+GpuIndexIVFPQ(
+    GpuResourcesProvider* provider,
+    Index* coarseQuantizer,
+    int dims,
+    idx_t nlist,
+    idx_t subQuantizers,
+    idx_t bitsPerCode,
+    faiss::MetricType metric = faiss::METRIC_L2,
+    GpuIndexIVFPQConfig config = GpuIndexIVFPQConfig());
+```
+
+<ParamField path="subQuantizers" type="idx_t" required>
+  Number of PQ sub-quantizers. `dims` must be divisible by `subQuantizers`.
+</ParamField>
+
+<ParamField path="bitsPerCode" type="idx_t" required>
+  Bits per PQ sub-quantizer code. Must be 4 or 8.
+</ParamField>
+
+**`GpuIndexIVFPQConfig`** fields:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `useFloat16LookupTables` | `bool` | `false` | Use FP16 lookup tables. Required when `subQuantizers × 2^bitsPerCode > 16384`. |
+| `usePrecomputedTables` | `bool` | `false` | Enable precomputed distance tables. Increases memory but speeds up search. |
+| `interleavedLayout` | `bool` | `false` | Interleaved IVF list layout (experimental, requires cuVS). |
+| `useMMCodeDistance` | `bool` | `false` | Use GEMM-backed distance computation (debugging). |
+| `indicesOptions` | `IndicesOptions` | `INDICES_64_BIT` | Index storage mode. |
+
+```python
+import faiss
+import numpy as np
+
+d = 128
+nb = 1000000
+nlist = 1024
+m = 16      # sub-quantizers
+nbits = 8   # bits per code
+
+res = faiss.StandardGpuResources()
+
+cfg = faiss.GpuIndexIVFPQConfig()
+cfg.useFloat16LookupTables = False
+
+gpu_index = faiss.GpuIndexIVFPQ(res, d, nlist, m, nbits,
+                                  faiss.METRIC_L2, cfg)
+gpu_index.train(xb)
+gpu_index.add(xb)
+gpu_index.nprobe = 32
+D, I = gpu_index.search(xq, 10)
+```
+
+---
+
+## GpuIndexIVFScalarQuantizer
+
+GPU-accelerated IVF index with scalar quantization encoding. Provides better recall than IVFPQ at the same nlist/nprobe, with moderate VRAM usage.
+
+```cpp
+// Auto-creates a flat coarse quantizer
+GpuIndexIVFScalarQuantizer(
+    GpuResourcesProvider* provider,
+    int dims,
+    idx_t nlist,
+    faiss::ScalarQuantizer::QuantizerType qtype,
+    faiss::MetricType metric = MetricType::METRIC_L2,
+    bool encodeResidual = true,
+    GpuIndexIVFScalarQuantizerConfig config = GpuIndexIVFScalarQuantizerConfig());
+```
+
+<ParamField path="qtype" type="ScalarQuantizer::QuantizerType" required>
+  Quantizer type: `QT_8bit`, `QT_4bit`, `QT_8bit_uniform`, `QT_fp16`, etc.
+</ParamField>
+
+<ParamField path="encodeResidual" type="bool">
+  Encode residuals from cluster centroids rather than raw vectors. Default: `true`. Better recall.
+</ParamField>
+
+```python
+import faiss
+
+d = 128
+nlist = 512
+res = faiss.StandardGpuResources()
+
+gpu_index = faiss.GpuIndexIVFScalarQuantizer(
+    res, d, nlist,
+    faiss.ScalarQuantizer.QT_8bit,
+    faiss.METRIC_L2,
+    True   # encodeResidual
+)
+gpu_index.train(xb)
+gpu_index.add(xb)
+gpu_index.nprobe = 16
+D, I = gpu_index.search(xq, 10)
+```
+
+---
+
+## GpuIndexCagra
+
+State-of-the-art GPU graph index powered by the [NVIDIA cuVS](https://github.com/rapidsai/cuvs) CAGRA (Compressed, Accurate GPU-based Approximate Nearest Neighbor) algorithm. CAGRA builds a highly optimized kNN graph on the GPU and delivers best-in-class recall/throughput tradeoffs.
+
+<Note>
+  `GpuIndexCagra` requires Faiss to be compiled with cuVS support (`-DFAISS_ENABLE_CUVS=ON`). It is not available in the default CPU-only build.
+</Note>
+
+```cpp
+GpuIndexCagra(
+    GpuResourcesProvider* provider,
+    int dims,
+    faiss::MetricType metric = faiss::METRIC_L2,
+    GpuIndexCagraConfig config = GpuIndexCagraConfig());
+```
+
+<ParamField path="provider" type="GpuResourcesProvider*" required>
+  GPU resource manager (`StandardGpuResources`).
+</ParamField>
+
+<ParamField path="dims" type="int" required>
+  Dimensionality of the input vectors.
+</ParamField>
+
+<ParamField path="metric" type="MetricType">
+  Distance metric. `METRIC_L2` or `METRIC_INNER_PRODUCT`. Default: `METRIC_L2`.
+</ParamField>
+
+### GpuIndexCagraConfig
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `graph_degree` | `size_t` | `64` | Out-degree of each node in the output graph. Higher = better recall, more memory. |
+| `intermediate_graph_degree` | `size_t` | `128` | Degree of the intermediate graph before pruning. Should be ≥ `graph_degree`. |
+| `build_algo` | `graph_build_algo` | `IVF_PQ` | Algorithm for KNN graph construction: `IVF_PQ`, `NN_DESCENT`, or `ITERATIVE_SEARCH`. |
+| `nn_descent_niter` | `size_t` | `20` | Iterations for `NN_DESCENT` build algorithm. |
+| `store_dataset` | `bool` | `true` | Whether to store the raw dataset on the GPU. |
+| `guarantee_connectivity` | `bool` | `false` | Apply MST optimization to guarantee graph connectivity. |
+
+### SearchParametersCagra
+
+Control search quality and performance at query time:
+
+| Field | Default | Description |
+|---|---|---|
+| `itopk_size` | `64` | Number of intermediate results retained. Main knob for recall/speed tradeoff. |
+| `max_iterations` | `0` (auto) | Upper bound on search iterations. |
+| `algo` | `AUTO` | Search algorithm: `SINGLE_CTA`, `MULTI_CTA`, `MULTI_KERNEL`, `AUTO`. |
+| `search_width` | `1` | Graph nodes selected as entry points per iteration. |
+
+**When to use:** Maximum throughput GPU search with high recall requirements. Outperforms IVF-based GPU indexes on most recall/throughput benchmarks when cuVS is available.
+
+```python
+import faiss
+import numpy as np
+
+d = 96
+nb = 1000000
+
+xb = np.random.random((nb, d)).astype('float32')
+xq = np.random.random((10000, d)).astype('float32')
+
+res = faiss.StandardGpuResources()
+
+cfg = faiss.GpuIndexCagraConfig()
+cfg.graph_degree = 64
+cfg.intermediate_graph_degree = 128
+cfg.build_algo = faiss.graph_build_algo.IVF_PQ
+
+index = faiss.GpuIndexCagra(res, d, faiss.METRIC_L2, cfg)
+index.train(xb)   # builds the CAGRA graph
+index.add(xb)
+
+# Fine-tune search parameters
+search_params = faiss.SearchParametersCagra()
+search_params.itopk_size = 128
+
+D, I = index.search(xq, 10, params=search_params)
+```
+
+### Converting between CAGRA and HNSW
+
+CAGRA graphs can be exported to `IndexHNSWCagra` for CPU search:
+
+```python
+# GPU CAGRA → CPU HNSW-compatible index
+cpu_index = faiss.IndexHNSWCagra(d, cfg.graph_degree)
+index.copyTo(cpu_index)     # transfer kNN graph to CPU
+
+# Set base_level_only for single-level graph operation
+cpu_index.base_level_only = True
+D, I = cpu_index.search(xq, 10)
+```
+
+---
+
+## IndicesOptions
+
+Controls how vector IDs are stored in GPU IVF indexes. This affects memory usage and how indices are returned.
+
+| Value | Description |
+|---|---|
+| `INDICES_CPU` | IDs stored on CPU only; GPU returns `(list, offset)` pairs that the CPU resolves. |
+| `INDICES_IVF` | IDs not stored; only `(list, offset)` is returned. Use when you manage your own ID mapping. |
+| `INDICES_32_BIT` | IDs stored as 32-bit integers on GPU, returned as 64-bit. |
+| `INDICES_64_BIT` | IDs stored as 64-bit integers on GPU (default). Full range of Faiss indices. |
+
+```python
+cfg = faiss.GpuIndexIVFFlatConfig()
+cfg.indicesOptions = faiss.INDICES_32_BIT   # saves ~4 bytes/vector on GPU
+```
+
+---
+
+## Memory management tips
+
+<Accordion title="Controlling temporary memory">
+  CAGRA and IVF searches allocate scratch memory from a pool managed by `StandardGpuResources`. By default this is 18% of available GPU memory. To reduce it:
+
+  ```python
+  res = faiss.StandardGpuResources()
+  res.setTempMemory(256 * 1024 * 1024)  # 256 MB
+  ```
+
+  To use the default allocation:
+
+  ```python
+  res.noTempMemory()  # allocate on demand, slower
+  ```
+</Accordion>
+
+<Accordion title="Unified memory for large datasets">
+  For datasets that don't fit in GPU VRAM, use unified memory (Pascal and later GPUs):
+
+  ```python
+  cfg = faiss.GpuIndexFlatConfig()
+  cfg.memorySpace = faiss.MemorySpace_Unified
+  gpu_index = faiss.GpuIndexFlatL2(res, d, cfg)
+  ```
+
+  Unified memory accesses data from CPU RAM when GPU VRAM is exhausted, at the cost of reduced bandwidth.
+</Accordion>
+
+<Accordion title="Multi-GPU with IndexReplicas">
+  `index_cpu_to_all_gpus` distributes the same index across all available GPUs as replicas. Each GPU holds a full copy of the index; queries are distributed across GPUs for throughput:
+
+  ```python
+  import faiss
+
+  cpu_index = faiss.IndexFlatL2(d)
+  # Replicate to all GPUs
+  gpu_index = faiss.index_cpu_to_all_gpus(cpu_index)
+
+  gpu_index.add(xb)
+
+  ngpus = faiss.get_num_gpus()
+  print(f"Searching with {ngpus} GPU replicas")
+
+  D, I = gpu_index.search(xq, 4)
+  ```
+
+  For sharded (partitioned) multi-GPU use, build separate indexes on each GPU and merge results manually.
+</Accordion>
+
+---
+
+## GPU index summary
+
+| Index | CPU equivalent | Training | Incremental add | Notes |
+|---|---|---|---|---|
+| `GpuIndexFlatL2` | `IndexFlatL2` | No | Yes | Exact, highest recall |
+| `GpuIndexFlatIP` | `IndexFlatIP` | No | Yes | Exact, inner product |
+| `GpuIndexIVFFlat` | `IndexIVFFlat` | Yes | Yes | Approximate, exact distances in clusters |
+| `GpuIndexIVFPQ` | `IndexIVFPQ` | Yes | Yes | Approximate, compressed |
+| `GpuIndexIVFScalarQuantizer` | `IndexIVFScalarQuantizer` | Yes | Yes | Approximate, scalar-quantized |
+| `GpuIndexCagra` | `IndexHNSWCagra` | Yes (graph build) | Yes | State-of-the-art recall/throughput; requires cuVS |

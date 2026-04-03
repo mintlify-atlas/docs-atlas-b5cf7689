@@ -1,0 +1,340 @@
+---
+title: "Quantization"
+description: "How Faiss compresses vectors using product quantization, scalar quantization, additive quantization, and binary quantization — and how to choose the right scheme for your use case."
+---
+
+Quantization is the process of representing high-dimensional float32 vectors in a compressed form. Faiss provides several quantization strategies that trade a small drop in search accuracy for dramatically reduced memory usage and faster distance computations.
+
+<Note>
+Quantization reduces the bytes needed per vector. A raw 128-dimensional float32 vector occupies 512 bytes. With PQ (8 subquantizers, 8 bits each) it occupies 8 bytes — a 64× reduction. With SQ8 it occupies 128 bytes — a 4× reduction.
+</Note>
+
+---
+
+## Memory comparison
+
+| Representation | Bytes per vector (d=128) | Relative to float32 |
+|---|---|---|
+| Raw `float32` | 512 bytes | 1× |
+| `SQfp16` (16-bit float) | 256 bytes | 2× smaller |
+| `SQ8` (8-bit scalar quantization) | 128 bytes | 4× smaller |
+| `SQ4` (4-bit scalar quantization) | 64 bytes | 8× smaller |
+| `PQ8x8` (8 subquantizers, 8 bits) | 8 bytes | 64× smaller |
+| `PQ8x4` (8 subquantizers, 4 bits) | 4 bytes | 128× smaller |
+
+---
+
+## Product quantization (PQ)
+
+Product quantization (PQ) is the most widely used compression method in Faiss. It divides each `d`-dimensional vector into `M` contiguous sub-vectors of dimension `d / M`, then independently quantizes each sub-vector using a codebook of `2^nbits` centroids.
+
+The compressed code for a vector is the concatenation of the `M` centroid indices, one per sub-vector. Storage per vector is `M × nbits / 8` bytes.
+
+At search time, Faiss precomputes a lookup table of distances from the query to all centroids in each sub-codebook. The approximate distance to any database vector is then computed by summing `M` table lookups — much faster than computing a full float32 distance.
+
+### Parameters
+
+| Parameter | Meaning | Typical values |
+|---|---|---|
+| `M` | Number of sub-quantizers (sub-vectors) | 8, 16, 32, 64 |
+| `nbits` | Bits per sub-code (codebook size = `2^nbits`) | 4, 8 |
+
+`M` must divide `d` evenly. Increasing `M` improves accuracy but increases the code size and the lookup table size.
+
+### IndexPQ
+
+`IndexPQ` is a flat (non-IVF) index that encodes all vectors with PQ and performs exhaustive search using lookup tables.
+
+```python
+import faiss
+
+d = 128   # vector dimension — must be divisible by M
+M = 8     # number of subquantizers
+nbits = 8 # bits per sub-code
+
+index = faiss.IndexPQ(d, M, nbits)
+
+# IndexPQ requires training
+index.train(xb)
+index.add(xb)
+D, I = index.search(xq, k=10)
+```
+
+```cpp
+// C++
+faiss::IndexPQ index(d, M, nbits);
+index.train(n, xb);
+index.add(n, xb);
+index.search(nq, xq, k, distances, labels);
+```
+
+### IndexIVFPQ
+
+`IndexIVFPQ` combines IVF coarse quantization with PQ residual encoding. The IVF layer partitions the space into `nlist` cells; PQ encodes the residual (the difference between a vector and its cell centroid). This is the most common configuration for large-scale approximate nearest neighbor search.
+
+```python
+import faiss
+
+d = 128
+nlist = 256   # number of IVF cells
+M = 8         # PQ subquantizers
+nbits = 8     # bits per sub-code
+
+quantizer = faiss.IndexFlatL2(d)
+index = faiss.IndexIVFPQ(quantizer, d, nlist, M, nbits)
+
+# Both the IVF quantizer and PQ codebooks require training
+index.train(xb)
+index.add(xb)
+
+index.nprobe = 8  # number of cells to probe at search time
+D, I = index.search(xq, k=10)
+```
+
+```python
+# Equivalent using index_factory
+index = faiss.index_factory(d, "IVF256,PQ8")
+index.train(xb)
+index.add(xb)
+```
+
+<Tip>
+A commonly used rule of thumb: set `nlist` ≈ `sqrt(n)` where `n` is the number of vectors, and `nprobe` ≈ `nlist / 16` to balance recall and speed. For very large datasets (hundreds of millions of vectors), `nlist` values of 4096 or 65536 are typical.
+</Tip>
+
+---
+
+## Scalar quantization (SQ)
+
+Scalar quantization encodes each float component independently using a uniform quantizer over the range `[vmin, vmax]`. It is simpler than PQ and loses less accuracy per bit, but compresses less aggressively.
+
+### Quantizer types
+
+The `ScalarQuantizer::QuantizerType` enum (defined in `faiss/impl/ScalarQuantizer.h`) lists all available precision levels:
+
+| Type | Bits per component | Description |
+|---|---|---|
+| `QT_8bit` | 8 | Per-dimension range, 256 levels |
+| `QT_4bit` | 4 | Per-dimension range, 16 levels |
+| `QT_6bit` | 6 | Per-dimension range, 64 levels |
+| `QT_fp16` | 16 | IEEE 754 half-precision float |
+| `QT_bf16` | 16 | bfloat16 |
+| `QT_8bit_uniform` | 8 | Shared range across all dimensions, 256 levels |
+| `QT_4bit_uniform` | 4 | Shared range across all dimensions, 16 levels |
+| `QT_8bit_direct` | 8 | Direct encoding of uint8 values (no training) |
+| `QT_8bit_direct_signed` | 8 | Direct encoding of int8 values in `[-128, 127]` |
+
+### IndexScalarQuantizer
+
+```python
+import faiss
+
+d = 128
+
+# 8-bit scalar quantization
+index = faiss.IndexScalarQuantizer(d, faiss.ScalarQuantizer.QT_8bit)
+
+# 16-bit float (half precision)
+index = faiss.IndexScalarQuantizer(d, faiss.ScalarQuantizer.QT_fp16)
+
+# 4-bit scalar quantization
+index = faiss.IndexScalarQuantizer(d, faiss.ScalarQuantizer.QT_4bit)
+
+# Training is required (to compute per-dimension range)
+index.train(xb)
+index.add(xb)
+D, I = index.search(xq, k=10)
+```
+
+```python
+# Via index_factory
+index = faiss.index_factory(d, "SQ8")    # QT_8bit
+index = faiss.index_factory(d, "SQfp16") # QT_fp16
+index = faiss.index_factory(d, "IVF256,SQ8")  # IVF + SQ8
+```
+
+### IndexIVFScalarQuantizer
+
+`IndexIVFScalarQuantizer` combines IVF partitioning with scalar quantization of the residuals, offering a middle ground between `IndexIVFFlat` (exact storage) and `IndexIVFPQ` (heavy compression).
+
+```python
+import faiss
+
+d = 128
+nlist = 256
+
+quantizer = faiss.IndexFlatL2(d)
+index = faiss.IndexIVFScalarQuantizer(
+    quantizer, d, nlist, faiss.ScalarQuantizer.QT_8bit
+)
+
+index.train(xb)
+index.add(xb)
+index.nprobe = 8
+D, I = index.search(xq, k=10)
+```
+
+---
+
+## Additive quantization
+
+Additive quantization (AQ) represents each vector as the sum of `M` codewords drawn from separate codebooks. Unlike PQ (which partitions the vector dimensions), AQ operates on the full-dimensional space at each stage, which generally yields better reconstruction quality for the same code length.
+
+Faiss provides several AQ variants, all accessible through `IndexAdditiveQuantizer` and its subclasses:
+
+<Accordion title="IndexResidualQuantizer (RQ)">
+  Residual quantization encodes the vector by iteratively quantizing the residual from the previous stage. Each codebook encodes what the previous stages could not represent.
+
+  ```python
+  import faiss
+
+  d = 128
+  M = 4      # number of codebooks
+  nbits = 8  # bits per codebook
+
+  index = faiss.IndexResidualQuantizer(d, M, nbits)
+  index.train(xb)
+  index.add(xb)
+  D, I = index.search(xq, k=10)
+  ```
+</Accordion>
+
+<Accordion title="IndexLocalSearchQuantizer (LSQ)">
+  Local search quantization optimizes codeword assignments jointly across all codebooks using a greedy local search procedure. It generally achieves better accuracy than RQ for the same code size at the cost of slower encoding.
+
+  ```python
+  import faiss
+
+  index = faiss.IndexLocalSearchQuantizer(d, M, nbits)
+  index.train(xb)
+  index.add(xb)
+  ```
+</Accordion>
+
+<Note>
+Additive quantization indexes require training. Encoding is slower than PQ because assignments across codebooks are interdependent, but search quality is typically higher for the same compressed code size.
+</Note>
+
+---
+
+## RaBitQ (binary quantization)
+
+`IndexRaBitQ` implements RaBitQ, a binary quantization scheme that encodes each vector into 1-bit-per-dimension codes using a random rotation. It is designed for very high compression ratios (1 bit per dimension = 32× compression vs float32) while maintaining competitive search quality through a re-scoring step with quantized queries.
+
+```python
+import faiss
+
+d = 128
+
+# nb_bits: bits per dimension used for the database vectors (default: 1)
+index = faiss.IndexRaBitQ(d, faiss.METRIC_L2, nb_bits=1)
+
+index.train(xb)
+index.add(xb)
+
+# qb controls how many bits are used to quantize each query vector at search time
+# Higher qb improves recall at the cost of slightly slower search
+D, I = index.search(xq, k=10)
+```
+
+`IndexRaBitQ` also has a FastScan variant (`IndexRaBitQFastScan`) that uses SIMD instructions for faster lookup table evaluation.
+
+---
+
+## FastScan variants
+
+FastScan variants rearrange PQ codes in memory to enable SIMD (AVX2/AVX-512) accelerated distance computations. They operate on 4-bit PQ codes and can be significantly faster than standard `IndexPQ` or `IndexIVFPQ` on modern CPUs.
+
+### IndexPQFastScan
+
+`IndexPQFastScan` is the flat (non-IVF) FastScan index. Codes are grouped into blocks of `bbs` vectors (default 32) for SIMD-friendly access patterns.
+
+```python
+import faiss
+
+d = 128
+M = 16    # number of subquantizers (4-bit codes)
+nbits = 4 # FastScan requires nbits=4
+
+index = faiss.IndexPQFastScan(d, M, nbits)
+index.train(xb)
+index.add(xb)
+D, I = index.search(xq, k=10)
+```
+
+### IndexIVFPQFastScan
+
+`IndexIVFPQFastScan` combines IVF partitioning with SIMD-accelerated 4-bit PQ decoding.
+
+```python
+import faiss
+
+d = 128
+nlist = 256
+M = 16
+nbits = 4
+
+quantizer = faiss.IndexFlatL2(d)
+index = faiss.IndexIVFPQFastScan(quantizer, d, nlist, M, nbits)
+index.train(xb)
+index.add(xb)
+index.nprobe = 8
+D, I = index.search(xq, k=10)
+```
+
+```python
+# Via index_factory (FastScan is selected automatically for 4-bit PQ in recent versions)
+index = faiss.index_factory(d, "IVF256,PQ16x4fsr")
+```
+
+---
+
+## Choosing a quantization method
+
+<Accordion title="I need the smallest possible memory footprint">
+  Use `IndexIVFPQ` with small `nbits` (4) or `IndexRaBitQ`. For a 128-dimensional vector with `PQ8x4`, storage drops to 4 bytes per vector.
+
+  ```python
+  index = faiss.index_factory(d, "IVF4096,PQ8x4")
+  ```
+</Accordion>
+
+<Accordion title="I need good accuracy with moderate compression">
+  Use `IndexIVFScalarQuantizer` with `QT_8bit` or `IndexIVFPQ` with `nbits=8`. SQ8 gives 4× compression with very small accuracy loss.
+
+  ```python
+  index = faiss.index_factory(d, "IVF256,SQ8")
+  # or
+  index = faiss.index_factory(d, "IVF256,PQ16")
+  ```
+</Accordion>
+
+<Accordion title="I need high throughput on CPU">
+  Use `IndexIVFPQFastScan` with 4-bit codes. FastScan uses SIMD instructions to evaluate multiple codes simultaneously.
+
+  ```python
+  index = faiss.index_factory(d, "IVF256,PQ16x4fsr")
+  ```
+</Accordion>
+
+<Accordion title="I need the best accuracy at a given code size">
+  Use additive quantization (`IndexResidualQuantizer` or `IndexLocalSearchQuantizer`). AQ typically outperforms PQ at the same bit budget, at the cost of slower encoding and search.
+
+  ```python
+  index = faiss.IndexResidualQuantizer(d, M=8, nbits=8)
+  ```
+</Accordion>
+
+---
+
+## Accuracy vs. memory tradeoff
+
+All quantization methods introduce a lossy compression: the reconstructed vector is an approximation of the original. This means:
+
+- Distance computations are approximate — two vectors that are close in compressed space may not be close in the original space.
+- Search recall is less than 100% — the true nearest neighbor may not appear in the top-k results.
+- You can partially recover accuracy by **re-ranking**: retrieve more candidates (e.g., top-100) using the compressed index, then re-score with the original float32 vectors for the final top-k.
+
+<Warning>
+The accuracy of a quantized index depends heavily on whether the data distribution matches the training data. Always train on a **representative sample** of your actual vectors. Training on random data and indexing semantic embeddings will give poor results.
+</Warning>

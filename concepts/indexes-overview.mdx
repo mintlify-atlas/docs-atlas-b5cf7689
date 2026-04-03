@@ -1,0 +1,257 @@
+---
+title: "Index types overview"
+description: "A guide to the index types available in Faiss, how the base Index interface works, and how to select and construct indexes using the index_factory string format."
+---
+
+Faiss is built around a common `Index` interface that all index types implement. The interface provides a consistent API for adding vectors, training internal structures, and searching — regardless of whether the index performs exact brute-force search or highly compressed approximate search.
+
+## The Index base class
+
+Every Faiss index inherits from `faiss::Index`. The key fields and methods you will use most often are:
+
+| Member | Type | Description |
+|---|---|---|
+| `d` | `int` | Vector dimensionality |
+| `ntotal` | `idx_t` | Number of vectors currently indexed |
+| `is_trained` | `bool` | Whether the index is ready to accept vectors |
+| `metric_type` | `MetricType` | Distance metric used for search |
+| `verbose` | `bool` | Enable verbose output |
+
+### Core methods
+
+**`train(n, x)`** — Trains internal structures (e.g., k-means centroids for IVF, PQ codebooks) on a representative sample of `n` vectors. Many index types set `is_trained = true` by default and do not require an explicit training step.
+
+```cpp
+// C++ signature
+virtual void train(idx_t n, const float* x);
+```
+
+```python
+# Python — train on 100,000 representative vectors
+index.train(xb[:100_000])
+```
+
+**`add(n, x)`** — Adds `n` vectors to the index. Vectors are assigned sequential integer IDs starting from `ntotal`.
+
+```cpp
+// C++ signature
+virtual void add(idx_t n, const float* x) = 0;
+```
+
+```python
+# Python
+index.add(xb)  # xb is a float32 numpy array, shape (n, d)
+```
+
+**`add_with_ids(n, x, xids)`** — Same as `add`, but allows you to supply custom integer IDs instead of sequential ones. Not supported by all index types.
+
+```python
+import numpy as np
+ids = np.arange(1000, 2000, dtype=np.int64)
+index.add_with_ids(xb, ids)
+```
+
+**`search(n, x, k, distances, labels)`** — Queries `n` vectors, returning the `k` nearest neighbors per query. Results fill two arrays: `distances` (shape `n × k`) and `labels` (shape `n × k`). If fewer than `k` results exist, remaining slots are padded with `-1`.
+
+```cpp
+// C++ signature
+virtual void search(
+    idx_t n,
+    const float* x,
+    idx_t k,
+    float* distances,
+    idx_t* labels,
+    const SearchParameters* params = nullptr) const = 0;
+```
+
+```python
+# Python — search for top-5 neighbors of 10 query vectors
+D, I = index.search(xq, k=5)
+# D: float32 array (10, 5) — distances
+# I: int64 array  (10, 5) — vector IDs
+```
+
+**`range_search(n, x, radius, result)`** — Returns all vectors within a given distance radius. Not implemented by all index types.
+
+**`reset()`** — Removes all vectors from the index without destroying it.
+
+---
+
+## Training requirement
+
+The `is_trained` property indicates whether an index is ready to accept vectors via `add()`. When `is_trained` is `false`, you must call `train()` first.
+
+<Note>
+`IndexFlat` and `IndexHNSWFlat` do not require training — `is_trained` starts as `true`. `IndexIVFFlat`, `IndexIVFPQ`, and `IndexPQ` all require training because they need to fit k-means centroids or PQ codebooks to the data distribution.
+</Note>
+
+```python
+import faiss
+import numpy as np
+
+d = 128
+xb = np.random.rand(100_000, d).astype("float32")
+
+quantizer = faiss.IndexFlatL2(d)
+index = faiss.IndexIVFFlat(quantizer, d, 100)
+
+print(index.is_trained)  # False
+
+index.train(xb)
+print(index.is_trained)  # True
+
+index.add(xb)
+```
+
+---
+
+## Index type comparison
+
+| Index type | Search quality | Memory per vector | Speed | When to use |
+|---|---|---|---|---|
+| `IndexFlat` | Exact (100% recall) | `4 × d` bytes (float32) | Slow for large datasets | Ground-truth baseline, small datasets |
+| `IndexIVFFlat` | Approximate | `4 × d` bytes + list overhead | Fast | Large datasets, moderate memory budget |
+| `IndexHNSW` | Approximate | `4 × d` bytes + graph links | Very fast | High-recall ANN with no memory constraint |
+| `IndexPQ` / `IndexIVFPQ` | Approximate | `M × nbits / 8` bytes | Fast | Billion-scale datasets, tight memory budget |
+| `IndexNSG` | Approximate | `4 × d` bytes + graph links | Fast | Graph-based ANN, competitive with HNSW |
+| `IndexScalarQuantizer` | Near-exact | `bits × d / 8` bytes | Fast | Moderate compression with low accuracy loss |
+
+<Tip>
+For most production use cases, **`IndexIVFPQ`** offers the best balance of memory efficiency and search speed. Use `IndexHNSW` when you need higher recall and have memory to spare.
+</Tip>
+
+### Flat indexes
+
+`IndexFlat` stores raw float32 vectors and performs exhaustive search — every query compares against every stored vector. This is slow at scale but always returns exact nearest neighbors.
+
+`IndexFlatL2` and `IndexFlatIP` are convenience subclasses that fix the metric to L2 or inner product respectively.
+
+### IVF indexes
+
+`IndexIVF` variants partition the vector space into `nlist` Voronoi cells using a coarse quantizer (typically `IndexFlatL2`). At search time only the `nprobe` closest cells are scanned, dramatically reducing the number of distance computations.
+
+The `nprobe` parameter trades recall for speed: higher `nprobe` means higher recall but slower search.
+
+### HNSW indexes
+
+`IndexHNSW` builds a navigable small-world graph over the dataset. Search traverses the graph starting from an entry point, following edges toward the query. `IndexHNSWFlat` backs the graph with raw float32 storage; `IndexHNSWPQ` and `IndexHNSWSQ` use compressed storage to reduce memory.
+
+The `M` parameter controls the number of neighbors per node in the graph. Higher `M` improves recall at the cost of memory and build time.
+
+### PQ and IVFPQ indexes
+
+`IndexPQ` encodes each vector as a sequence of `M` sub-codes using product quantization. Storage shrinks to `M × nbits / 8` bytes per vector — a factor of `4 × d / (M × nbits / 8)` over float32. `IndexIVFPQ` combines IVF coarse quantization with PQ residual encoding.
+
+### NSG indexes
+
+`IndexNSG` builds a Navigating Spreading-out Graph over the dataset. It is competitive with HNSW in search speed while often using less memory for the graph structure.
+
+### Scalar quantizer indexes
+
+`IndexScalarQuantizer` quantizes each float component independently using a uniform scalar quantizer. Types like `QT_8bit` (8 bits per component) and `QT_fp16` (16-bit float) provide a smooth tradeoff between the full precision of `IndexFlat` and the heavy compression of PQ.
+
+---
+
+## The index_factory string format
+
+`faiss::index_factory` (Python: `faiss.index_factory`) constructs an index from a human-readable descriptor string. This is the recommended way to create indexes because it makes the configuration explicit and serializable.
+
+```cpp
+// C++ signature
+Index* index_factory(
+    int d,
+    const char* description,
+    MetricType metric = METRIC_L2,
+    bool own_invlists = true);
+```
+
+```python
+import faiss
+
+d = 128  # vector dimension
+
+index = faiss.index_factory(d, "Flat")
+index = faiss.index_factory(d, "IVF100,Flat")
+index = faiss.index_factory(d, "IVF100,PQ8")
+index = faiss.index_factory(d, "HNSW32")
+index = faiss.index_factory(d, "IVF256,SQ8")
+index = faiss.index_factory(d, "IVF100,PQ8", faiss.METRIC_INNER_PRODUCT)
+```
+
+### Descriptor syntax
+
+The descriptor is a comma-separated string of processing stages read left to right:
+
+<Tabs>
+  <Tab title="Preprocessing (optional)">
+    Preprocessing transforms applied before indexing. These appear at the start of the string.
+
+    | Prefix | Meaning |
+    |---|---|
+    | `PCA64` | Reduce to 64 dimensions with PCA |
+    | `OPQ16_64` | OPQ pre-rotation with 16 subquantizers, output dim 64 |
+    | `L2norm` | L2-normalize input vectors |
+
+    Example: `"PCA64,IVF256,Flat"` — reduce to 64 dimensions, then use IVF with 256 lists.
+  </Tab>
+  <Tab title="Coarse quantizer / graph index">
+    The main index structure. If an IVF index is used, this also names the coarse quantizer.
+
+    | Token | Index type |
+    |---|---|
+    | `Flat` | `IndexFlat` (exact search) |
+    | `IVF100` | `IndexIVF` with 100 inverted lists |
+    | `HNSW32` | `IndexHNSW` with M=32 |
+    | `NSG32` | `IndexNSG` with R=32 |
+    | `IMI2x8` | Multi-index with 2 levels, 8 bits each |
+
+  </Tab>
+  <Tab title="Encoding (for IVF)">
+    Specifies how residual vectors inside inverted lists are encoded.
+
+    | Token | Encoding |
+    |---|---|
+    | `Flat` | No compression — raw float32 residuals |
+    | `PQ8` | Product quantization, 8 subquantizers, 8 bits each |
+    | `PQ8x4` | Product quantization, 8 subquantizers, 4 bits each |
+    | `SQ4` | Scalar quantization, 4 bits per component |
+    | `SQ8` | Scalar quantization, 8 bits per component |
+    | `SQfp16` | Scalar quantization, 16-bit float |
+
+  </Tab>
+</Tabs>
+
+### Common factory strings
+
+| String | Description | Notes |
+|---|---|---|
+| `"Flat"` | Exact brute-force search | No training required |
+| `"IVF100,Flat"` | IVF with 100 lists, no residual compression | Requires training |
+| `"IVF100,PQ8"` | IVF with 100 lists, PQ-8 residual encoding | Requires training |
+| `"IVF256,SQ8"` | IVF with 256 lists, 8-bit scalar quantization | Requires training |
+| `"HNSW32"` | HNSW graph index with M=32 | No training required |
+| `"PQ16"` | Standalone product quantization, 16 subquantizers | Requires training |
+| `"IVF4096,PQ16"` | IVF+PQ suitable for billion-scale datasets | Requires training |
+
+<Warning>
+After creating an index with `index_factory`, always check `index.is_trained`. If `False`, call `index.train(xb)` on a representative sample before calling `index.add()`.
+</Warning>
+
+---
+
+## Reference
+
+<CardGroup cols={2}>
+  <Card title="Flat indexes" href="/reference/flat-indexes">
+    `IndexFlat`, `IndexFlatL2`, `IndexFlatIP` — exact brute-force search.
+  </Card>
+  <Card title="IVF indexes" href="/reference/ivf-indexes">
+    `IndexIVFFlat`, `IndexIVFPQ`, `IndexIVFScalarQuantizer` — inverted file indexes.
+  </Card>
+  <Card title="Graph indexes" href="/reference/graph-indexes">
+    `IndexHNSW`, `IndexNSG` — graph-based approximate nearest neighbor search.
+  </Card>
+  <Card title="Quantization" href="/concepts/quantization">
+    PQ, SQ, and additive quantization — how Faiss compresses vectors.
+  </Card>
+</CardGroup>

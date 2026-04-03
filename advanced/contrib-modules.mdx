@@ -1,0 +1,340 @@
+---
+title: "Contrib modules"
+description: "The faiss.contrib package contains optional helper utilities for PyTorch interoperability, on-disk indexes, distributed search, evaluation, clustering, and more."
+---
+
+The `faiss.contrib` package lives in the `contrib/` directory of the Faiss repository and is compiled into the `faiss.contrib` Python module. These helpers are **not** part of the core Faiss library; they are optional utilities that solve common higher-level tasks. Some modules require additional dependencies such as PyTorch or h5py—these are not installed automatically.
+
+```python
+# General import pattern
+from faiss.contrib import torch_utils
+from faiss.contrib import evaluation
+from faiss.contrib.ondisk import merge_ondisk
+from faiss.contrib.ivf_tools import replace_ivf_quantizer
+```
+
+<Note>
+Although contrib modules ship with Faiss, they are not compiled in unconditionally. If a module requires an optional dependency (e.g. `torch`, `h5py`, `scipy`), install that dependency separately before importing the module.
+</Note>
+
+---
+
+## Modules
+
+<AccordionGroup>
+
+  <Accordion title="torch_utils — PyTorch tensor interoperability">
+
+**Import:** `from faiss.contrib import torch_utils`
+
+Importing `torch_utils` monkey-patches the Faiss Python bindings so that PyTorch tensors (CPU or GPU) can be passed directly anywhere a NumPy array is expected—no copies required.
+
+```python
+import torch
+import faiss
+from faiss.contrib import torch_utils   # patches faiss in-place
+
+d, nb, nq = 128, 100_000, 1000
+xb = torch.rand(nb, d, dtype=torch.float32)
+xq = torch.rand(nq, d, dtype=torch.float32)
+
+index = faiss.IndexFlatL2(d)
+index.add(xb)      # torch CPU tensor accepted directly
+D, I = index.search(xq, 10)   # returns torch tensors
+```
+
+GPU tensors are supported **only** with Faiss GPU indexes. When Faiss GPU support is available, the module automatically performs CUDA stream synchronization with the current PyTorch stream:
+
+```python
+import torch
+import faiss
+from faiss.contrib import torch_utils
+
+res = faiss.StandardGpuResources()
+index_cpu = faiss.IndexFlatL2(d)
+index_gpu = faiss.index_cpu_to_gpu(res, 0, index_cpu)
+
+xb_gpu = torch.rand(nb, d, device='cuda', dtype=torch.float32)
+xq_gpu = torch.rand(nq, d, device='cuda', dtype=torch.float32)
+
+index_gpu.add(xb_gpu)
+D, I = index_gpu.search(xq_gpu, 10)
+```
+
+Numpy arrays continue to work after importing `torch_utils`. You may **not** mix numpy and torch arguments in a single call.
+
+<Tip>
+`torch_utils` is the recommended way to use Faiss inside a PyTorch training loop: GPU tensors can be queried directly without a device round-trip, which eliminates a significant overhead at high query rates.
+</Tip>
+
+  </Accordion>
+
+  <Accordion title="ondisk — on-disk inverted lists for large datasets">
+
+**Import:** `from faiss.contrib.ondisk import merge_ondisk`
+
+`ondisk.py` provides the logic to merge several IVF shard index files into a single on-disk index whose inverted lists are memory-mapped. This allows the combined dataset to exceed available RAM.
+
+```python
+from faiss.contrib.ondisk import merge_ondisk
+import faiss
+
+# trained_index: an empty trained IVF index (no vectors added yet)
+# shard_fnames:  list of paths to populated shard index files
+# ivfdata_fname: path where the merged inverted-list data will be written
+merge_ondisk(
+    trained_index,
+    shard_fnames=["shard0.index", "shard1.index", "shard2.index"],
+    ivfdata_fname="merged.ivfdata",
+)
+
+# Save the merged index (the ivfdata file is referenced by offset)
+faiss.write_index(trained_index, "merged.index")
+```
+
+The function loads each shard with `IO_FLAG_MMAP` to avoid copying data into RAM, then creates a `faiss.OnDiskInvertedLists` that writes the merged lists to `ivfdata_fname`.
+
+<Note>
+`IndexIVFPQR` is not supported as an on-disk index target.
+</Note>
+
+  </Accordion>
+
+  <Accordion title="client_server — RPC-based distributed Faiss index">
+
+**Import:** `from faiss.contrib import client_server`
+
+`client_server.py` (backed by `rpc.py`) implements a simple Remote Procedure Call layer that exposes a Faiss index over a TCP socket. This is the building block for distributing a large index across several machines.
+
+The server loads a Faiss index and listens for search requests:
+
+```python
+# server.py
+from faiss.contrib.client_server import run_index_server
+import faiss
+
+index = faiss.read_index("shard0.index")
+run_index_server(index, port=12345)
+```
+
+The client connects and issues searches as if the index were local:
+
+```python
+# client.py
+from faiss.contrib.client_server import ClientIndex
+
+index = ClientIndex("localhost", 12345)
+D, I = index.search(xq, 10)
+```
+
+Function parameters and return values are serialized with Python's `pickle` module via `rpc.py`.
+
+  </Accordion>
+
+  <Accordion title="exhaustive_search — ground-truth computation">
+
+**Import:** `from faiss.contrib import exhaustive_search`
+
+`exhaustive_search.py` computes exact brute-force nearest-neighbor search results for a dataset that may not fit in RAM. It uses GPU if available.
+
+```python
+from faiss.contrib.exhaustive_search import knn_ground_truth
+
+# xb_iterator: any iterable that yields (batch, start_id) pairs
+# Returns (D, I) arrays of shape (nq, k)
+D, I = knn_ground_truth(xq, xb_iterator, k)
+```
+
+This is the standard way to produce `gt_I` / `gt_D` arrays for use with `AutoTuneCriterion.set_groundtruth()` or `eval_intersection`.
+
+  </Accordion>
+
+  <Accordion title="clustering — k-means variants">
+
+**Import:** `from faiss.contrib.clustering import two_level_clustering`
+
+`clustering.py` provides clustering utilities beyond the built-in `faiss.Kmeans`, including:
+
+- **Python k-means** — works on special data types (e.g. SciPy sparse matrices) where the built-in C++ Kmeans cannot be used directly.
+- **Two-level hierarchical clustering** — useful when the target number of clusters is too large to train in a single pass.
+
+```python
+from faiss.contrib.clustering import two_level_clustering
+import faiss
+
+# nc1: coarse clusters at level 1
+# nc2: fine clusters at level 2 (final number of centroids)
+centroids = two_level_clustering(
+    xt,       # training vectors, shape (n, d)
+    nc1=256,
+    nc2=65536,
+    rebalance=True,
+    clustering_niter=25,
+    verbose=True,
+)
+```
+
+`rebalance=True` allocates sub-cluster counts proportional to the size of each coarse cluster, which produces more evenly populated inverted lists.
+
+  </Accordion>
+
+  <Accordion title="evaluation — search quality metrics">
+
+**Import:** `from faiss.contrib import evaluation`
+
+`evaluation.py` provides metric functions for evaluating kNN and range-search quality.
+
+**Intersection measure for kNN results:**
+
+```python
+from faiss.contrib.evaluation import knn_intersection_measure
+
+# I1, I2: result index arrays of shape (nq, k)
+# Returns the fraction of positions that agree across all queries
+score = knn_intersection_measure(I1, I2)
+```
+
+**Precision-recall for range search:**
+
+```python
+from faiss.contrib.evaluation import range_PR
+
+precision, recall = range_PR(
+    lims_ref, Iref,   # ground-truth lims and indices
+    lims_new, Inew,   # approximate lims and indices
+    mode="overall",   # or "average"
+)
+```
+
+**`RepeatTimer` — repeatable timing utility:**
+
+```python
+from faiss.contrib.evaluation import RepeatTimer
+
+timer = RepeatTimer(warmup=1, nt=1, runs=6)
+for _ in timer:
+    D, I = index.search(xq, 10)
+
+print(f"time={timer.ms():.1f} ± {timer.ms_std():.1f} ms")
+```
+
+  </Accordion>
+
+  <Accordion title="factory_tools — index factory string utilities">
+
+**Import:** `from faiss.contrib import factory_tools`
+
+`factory_tools.py` provides helpers for working programmatically with Faiss index factory strings.
+
+**Compute per-vector code size:**
+
+```python
+from faiss.contrib.factory_tools import get_code_size
+
+bytes_per_vec = get_code_size(d=128, indexkey="IVF4096,PQ32")
+# Returns the number of bytes used to store one vector in the index
+```
+
+**Recover the factory string from a live index:**
+
+```python
+from faiss.contrib.factory_tools import reverse_index_factory
+
+index = faiss.index_factory(128, "OPQ16_64,IVF4096,PQ16")
+key = reverse_index_factory(index)
+# key == "OPQ16_64,IVF4096,PQ16"
+```
+
+**Read the HNSW M parameter:**
+
+```python
+from faiss.contrib.factory_tools import get_hnsw_M
+
+index = faiss.IndexHNSWFlat(128, 32)
+M = get_hnsw_M(index)   # M == 32
+```
+
+  </Accordion>
+
+  <Accordion title="ivf_tools — custom IVF quantizer assignment">
+
+**Import:** `from faiss.contrib import ivf_tools`
+
+`ivf_tools.py` exposes low-level control over IVF inverted list assignment, allowing you to bypass the built-in coarse quantizer.
+
+**Add vectors with pre-computed assignments:**
+
+```python
+from faiss.contrib.ivf_tools import add_preassigned
+
+# a: int array of shape (n,) with centroid assignments
+add_preassigned(index_ivf, x, a)
+```
+
+**Search with pre-computed list selections:**
+
+```python
+from faiss.contrib.ivf_tools import search_preassigned
+
+# list_nos: int array of shape (nq, nprobe)
+D, I = search_preassigned(index_ivf, xq, k, list_nos)
+```
+
+**Replace the coarse quantizer in-place:**
+
+```python
+from faiss.contrib.ivf_tools import replace_ivf_quantizer
+
+new_quantizer = faiss.IndexFlatL2(index_ivf.d)
+old_quantizer = replace_ivf_quantizer(index_ivf, new_quantizer)
+```
+
+The function transfers centroid vectors from the old quantizer if the new one is empty, then cleanly deallocates the old quantizer.
+
+  </Accordion>
+
+  <Accordion title="big_batch_search — efficient large query-set search">
+
+**Import:** `from faiss.contrib import big_batch_search`
+
+`big_batch_search.py` is designed for the scenario where both the database index and the query set are too large to fit in RAM simultaneously. It searches an IVF index one inverted list at a time, streaming both queries and database vectors.
+
+```python
+from faiss.contrib.big_batch_search import big_batch_search
+
+# index_ivf: a trained and populated IVF index
+# xq: query vectors
+D, I = big_batch_search(index_ivf, xq, k, verbose=True)
+```
+
+This is most useful when profiling large-scale retrieval pipelines where standard `index.search(xq, k)` would exceed memory limits.
+
+  </Accordion>
+
+  <Accordion title="datasets — standard ANN benchmark dataset loaders">
+
+**Import:** `from faiss.contrib.datasets import DatasetSIFT1M, SyntheticDataset`
+
+**Requires:** `h5py` for HDF5-backed datasets.
+
+`datasets.py` provides a consistent interface for the standard ANN benchmark datasets and synthetic data used in the `benchs/` scripts.
+
+```python
+from faiss.contrib.datasets import DatasetSIFT1M, SyntheticDataset
+
+# Standard SIFT1M dataset (reads from sift1M/ subdirectory)
+ds = DatasetSIFT1M()
+xb  = ds.get_database()     # shape (1_000_000, 128)
+xq  = ds.get_queries()      # shape (10_000, 128)
+xt  = ds.get_train()        # shape (100_000, 128)
+gt  = ds.get_groundtruth()  # shape (10_000, 100)
+
+# Synthetic dataset for unit tests and benchmarks
+ds = SyntheticDataset(d=128, nt=10_000, nb=100_000, nq=1_000)
+xb = ds.get_database()
+xq = ds.get_queries()
+```
+
+  </Accordion>
+
+</AccordionGroup>
